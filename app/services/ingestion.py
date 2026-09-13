@@ -64,7 +64,9 @@ def _safe_get(
 
 class FeedSyncError(ValueError):
     """The feed URL couldn't be fetched or parsed. Existing feed-sourced rows are
-    flagged `sync_stale` rather than removed (ING-5: serve last-known-good)."""
+    flagged `sync_stale` rather than removed (ING-5: serve last-known-good) —
+    a row is only ever delisted by a *successful* sync that confirms it's gone
+    (see _reconcile_removed_feed_rows), never by a failure."""
 
 
 class ScrapeError(ValueError):
@@ -83,6 +85,48 @@ def _set_feed_rows_stale(session: Session, widget_id: int, stale: bool) -> None:
     session.commit()
 
 
+def _reconcile_removed_feed_rows(
+    session: Session,
+    vector_store: CatalogItemVectorStore,
+    widget: Widget,
+    raw_rows: list[dict],
+) -> int:
+    """A successful sync confirms the full current state of the upstream feed, so
+    any previously-synced feed row whose title is no longer present has actually
+    been removed upstream — not just a transient fetch failure (that case is
+    `sync_stale`, set on error, never here). Such a row is "delisted" (removed from
+    the vector store, excluded from retrieval) rather than hard-deleted: an Event
+    or Recommendation may still reference its id for historical analytics, and
+    import_catalog_rows reactivates a delisted row if its title reappears in a
+    later sync instead of inserting a duplicate.
+    """
+    current_titles = set()
+    for raw in raw_rows:
+        title = _coerce_row(raw).get("title")
+        if title:
+            current_titles.add(str(title).strip().lower())
+
+    stale_rows = session.scalars(
+        select(CatalogItem).where(
+            CatalogItem.widget_id == widget.id,
+            CatalogItem.ingestion_adapter == "feed",
+            CatalogItem.review_status == "approved",
+        )
+    ).all()
+    delisted = 0
+    for row in stale_rows:
+        if row.title.strip().lower() in current_titles:
+            continue
+        vector_store.delete(row.id, widget.id)
+        row.review_status = "delisted"
+        row.vector_synced = False
+        row.vector_index_status = "pending"
+        delisted += 1
+    if delisted:
+        session.commit()
+    return delisted
+
+
 def sync_feed(
     session: Session, vector_store: CatalogItemVectorStore, widget: Widget
 ) -> list[dict]:
@@ -92,6 +136,8 @@ def sync_feed(
     stamped now. On any fetch/parse failure, existing feed-sourced rows for this
     widget are marked `sync_stale=True` (and left in place, still serving) rather than
     raising past the caller silently — callers surface `FeedSyncError` to the admin.
+    On success, any previously-synced feed row no longer present in the fresh feed
+    is delisted (see _reconcile_removed_feed_rows) rather than left live indefinitely.
     """
     if not widget.feed_url:
         raise FeedSyncError("No feed URL configured for this widget.")
@@ -125,6 +171,7 @@ def sync_feed(
         ingestion_adapter="feed",
         last_synced_at=datetime.now(timezone.utc),
     )
+    _reconcile_removed_feed_rows(session, vector_store, widget, raw_rows)
     _set_feed_rows_stale(session, widget.id, False)
     return results
 

@@ -348,6 +348,88 @@ def test_scrape_preview_rejects_internal_url_without_ever_calling_httpx(
         scrape_preview("http://127.0.0.1:8000/admin")
 
 
+FEED_JSON_TWO_ITEMS = b"""
+{"models": [
+    {"title": "Feed Item One", "provider": "Feed Co", "category": "LLM",
+     "price": "$1", "description": "From the feed."},
+    {"title": "Feed Item Two", "provider": "Feed Co", "category": "LLM",
+     "price": "$2", "description": "Also from the feed."}
+]}
+"""
+
+
+def test_feed_sync_delists_item_no_longer_present_upstream(
+    client, reference_widget, monkeypatch
+) -> None:
+    widget, _ = reference_widget
+
+    def fake_get_two(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON_TWO_ITEMS)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_two)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        sync_feed(session, client.app.state.vector_store, widget_row)
+
+        item_two = session.query(CatalogItem).filter_by(title="Feed Item Two").one()
+        assert item_two.vector_synced is True
+
+    def fake_get_one(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_one)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        sync_feed(session, client.app.state.vector_store, widget_row)
+
+        item_one = session.query(CatalogItem).filter_by(title="Feed Item One").one()
+        assert item_one.review_status == "approved"
+
+        item_two = session.query(CatalogItem).filter_by(title="Feed Item Two").one()
+        assert item_two.review_status == "delisted"
+        assert item_two.vector_synced is False
+        assert not client.app.state.vector_store.contains(item_two.id, widget.id)
+
+
+def test_feed_sync_reactivates_delisted_item_that_reappears(
+    client, reference_widget, monkeypatch
+) -> None:
+    widget, _ = reference_widget
+
+    def fake_get_two(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON_TWO_ITEMS)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_two)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        sync_feed(session, client.app.state.vector_store, widget_row)
+
+    def fake_get_one(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_one)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        sync_feed(session, client.app.state.vector_store, widget_row)
+        item_two_id = (
+            session.query(CatalogItem).filter_by(title="Feed Item Two").one().id
+        )
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_two)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        rows = sync_feed(session, client.app.state.vector_store, widget_row)
+        reactivated = [row for row in rows if row["title"] == "Feed Item Two"][0]
+        assert reactivated["status"] == "reactivated"
+
+        item_two = session.get(CatalogItem, item_two_id)
+        assert item_two.review_status == "approved"
+        assert item_two.vector_synced is True
+        assert client.app.state.vector_store.contains(item_two.id, widget.id)
+
+
 def test_scrape_preview_revalidates_each_redirect_hop(monkeypatch) -> None:
     """A URL that resolves safely can still redirect to an internal address —
     following it with no re-check would defeat the guard entirely."""
