@@ -43,6 +43,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.15
+      # Makes create_app fail fast if SECRET_KEY below is ever left unset/default
+      # instead of silently signing admin JWTs with the value published in this repo.
+      - key: APP_ENV
+        value: production
       # Random, unique per deploy — do not reuse the local-dev SECRET_KEY.
       - key: SECRET_KEY
         generateValue: true

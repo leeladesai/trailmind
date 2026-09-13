@@ -28,9 +28,38 @@ from app.services.catalog_import import (
     import_catalog_rows,
     parse_catalog_file,
 )
+from app.services.url_safety import UnsafeURLError, assert_url_is_safe
 from app.vector import CatalogItemVectorStore
 
 FETCH_TIMEOUT_SECONDS = 10.0
+MAX_REDIRECTS = 5
+
+
+def _safe_get(
+    url: str,
+    *,
+    headers: dict | None = None,
+    timeout: float = FETCH_TIMEOUT_SECONDS,
+    follow_redirects: bool = False,
+) -> httpx.Response:
+    """SSRF-guarded httpx.get: re-validates the target before every fetch,
+    including each redirect hop — a URL that resolves safely can still redirect
+    to an internal address, and blindly following it would fetch that hop with
+    no check at all."""
+    current_url = url
+    for _ in range(MAX_REDIRECTS + 1):
+        assert_url_is_safe(current_url)
+        response = httpx.get(
+            current_url, headers=headers or {}, timeout=timeout, follow_redirects=False
+        )
+        if follow_redirects and getattr(response, "is_redirect", False):
+            location = response.headers.get("location")
+            if not location:
+                return response
+            current_url = str(httpx.URL(current_url).join(location))
+            continue
+        return response
+    raise UnsafeURLError(f"Too many redirects while fetching {url!r}.")
 
 
 class FeedSyncError(ValueError):
@@ -73,11 +102,14 @@ def sync_feed(
         else {}
     )
     try:
-        response = httpx.get(
+        response = _safe_get(
             widget.feed_url, headers=headers, timeout=FETCH_TIMEOUT_SECONDS
         )
         response.raise_for_status()
         raw_rows = parse_catalog_file("feed.json", response.content)
+    except UnsafeURLError as exc:
+        _set_feed_rows_stale(session, widget.id, True)
+        raise FeedSyncError(str(exc)) from exc
     except httpx.HTTPError as exc:
         _set_feed_rows_stale(session, widget.id, True)
         raise FeedSyncError(f"Could not fetch feed: {exc}") from exc
@@ -167,8 +199,10 @@ def scrape_preview(url: str, selectors: dict[str, str] | None = None) -> dict:
     `{"rows": [...], "markup_type": "json-ld" | "css-selector"}`.
     """
     try:
-        response = httpx.get(url, timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True)
+        response = _safe_get(url, timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True)
         response.raise_for_status()
+    except UnsafeURLError as exc:
+        raise ScrapeError(str(exc)) from exc
     except httpx.HTTPError as exc:
         raise ScrapeError(f"Could not fetch page: {exc}") from exc
 

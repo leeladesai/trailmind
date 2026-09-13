@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.config import Settings
+from app.config import DEFAULT_SECRET_KEY, Settings
 from app.db import build_session_factory
 from app.models import (
     AuditLog,
@@ -194,6 +194,14 @@ def as_utc(value):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or Settings()
+    if (
+        app_settings.app_env == "production"
+        and app_settings.secret_key == DEFAULT_SECRET_KEY
+    ):
+        raise RuntimeError(
+            "Refusing to start with APP_ENV=production and the default SECRET_KEY — "
+            "set a real SECRET_KEY (render.yaml already does this via generateValue)."
+        )
     configure_langsmith(app_settings)
     session_factory = build_session_factory(app_settings)
     vector_store = CatalogItemVectorStore(

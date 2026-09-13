@@ -9,6 +9,7 @@ Widget's docstring in app/models.py).
 """
 
 import httpx
+import pytest
 
 import app.services.ingestion as ingestion_module
 from app.models import CatalogItem, Widget
@@ -27,6 +28,8 @@ class _FakeResponse:
         self.content = content
         self.text = text
         self.status_code = status_code
+        self.is_redirect = False
+        self.headers: dict = {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -63,7 +66,7 @@ def _login(client) -> None:
 def test_feed_sync_imports_rows_tagged_and_stamped(
     client, reference_widget, monkeypatch
 ) -> None:
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **_kwargs):
         return _FakeResponse(content=FEED_JSON)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -87,7 +90,7 @@ def test_feed_sync_imports_rows_tagged_and_stamped(
 def test_feed_sync_marks_existing_rows_stale_on_failure(
     client, reference_widget, monkeypatch
 ) -> None:
-    def fake_get_ok(url, headers=None, timeout=None):
+    def fake_get_ok(url, headers=None, timeout=None, **_kwargs):
         return _FakeResponse(content=FEED_JSON)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_ok)
@@ -98,7 +101,7 @@ def test_feed_sync_marks_existing_rows_stale_on_failure(
         configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
         sync_feed(session, client.app.state.vector_store, widget_row)
 
-    def fake_get_fail(url, headers=None, timeout=None):
+    def fake_get_fail(url, headers=None, timeout=None, **_kwargs):
         raise httpx.ConnectError("network down")
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_fail)
@@ -116,7 +119,7 @@ def test_feed_sync_marks_existing_rows_stale_on_failure(
 
 
 def test_scrape_preview_extracts_json_ld_product(client, monkeypatch) -> None:
-    def fake_get(url, timeout=None, follow_redirects=True):
+    def fake_get(url, timeout=None, follow_redirects=True, **_kwargs):
         return _FakeResponse(text=PRODUCT_PAGE_HTML)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -128,7 +131,7 @@ def test_scrape_preview_extracts_json_ld_product(client, monkeypatch) -> None:
 
 
 def test_scrape_preview_raises_when_no_markup_found(client, monkeypatch) -> None:
-    def fake_get(url, timeout=None, follow_redirects=True):
+    def fake_get(url, timeout=None, follow_redirects=True, **_kwargs):
         return _FakeResponse(text="<html><body>Nothing here.</body></html>")
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -214,7 +217,7 @@ def test_ingestion_status_reflects_feed_and_scrape_state(
     _login(client)
     widget, _ = reference_widget
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **_kwargs):
         return _FakeResponse(content=FEED_JSON)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -309,3 +312,55 @@ def test_ingestion_status_isolated_per_widget(client, reference_widget) -> None:
     assert login.status_code == 200
     status = client.get(f"/api/admin/widgets/{other_widget_id}/ingestion/status")
     assert status.json()["scrape"]["pending_review"] == 0
+
+
+# P0-6 (SSRF guard): feed sync and scrape preview must refuse to fetch
+# internal/private targets even though an admin fully controls both inputs — an
+# admin account on one tenant is not a trusted operator of the shared server's
+# network, and a compromised admin session shouldn't become an SSRF pivot.
+
+
+def test_feed_sync_rejects_internal_url_without_ever_calling_httpx(
+    client, reference_widget, monkeypatch
+) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("httpx.get must not be called for an unsafe URL")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fail_if_called)
+    widget, _ = reference_widget
+
+    with client.app.state.session_factory() as session:
+        widget = session.get(Widget, widget.id)
+        configure_feed(session, widget, "http://169.254.169.254/latest/meta-data/")
+        with pytest.raises(FeedSyncError):
+            sync_feed(session, client.app.state.vector_store, widget)
+
+
+def test_scrape_preview_rejects_internal_url_without_ever_calling_httpx(
+    monkeypatch,
+) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("httpx.get must not be called for an unsafe URL")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fail_if_called)
+
+    with pytest.raises(ScrapeError):
+        scrape_preview("http://127.0.0.1:8000/admin")
+
+
+def test_scrape_preview_revalidates_each_redirect_hop(monkeypatch) -> None:
+    """A URL that resolves safely can still redirect to an internal address —
+    following it with no re-check would defeat the guard entirely."""
+
+    def fake_get(url, timeout=None, follow_redirects=False, **_kwargs):
+        if url == "https://shop.example.com/widget":
+            response = _FakeResponse(status_code=302)
+            response.is_redirect = True
+            response.headers = {"location": "http://169.254.169.254/secret"}
+            return response
+        raise AssertionError(f"unexpected fetch of {url!r}")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
+
+    with pytest.raises(ScrapeError):
+        scrape_preview("https://shop.example.com/widget")

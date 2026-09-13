@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import socket
 from collections.abc import Iterator
@@ -76,6 +77,27 @@ def _block_external_network() -> Iterator[None]:
         yield
     finally:
         socket.socket.connect = _real_socket_connect
+
+
+# P0-6 (SSRF guard, app/services/url_safety.py): resolving a hostname is itself a
+# real network operation and isn't a socket.socket.connect call, so it slips past
+# the guard above — left unstubbed, every ingestion test naming a domain like
+# "vendor.example.com" would perform a real DNS lookup. Default every test to a
+# deterministic public address; a test exercising the guard's rejection path
+# overrides this via its own monkeypatch fixture parameter.
+def _fake_public_getaddrinfo(host, *_args, **_kwargs):
+    # A literal IP address resolves to itself (real getaddrinfo does the same) —
+    # this must not mask the url_safety tests that pass an internal IP directly.
+    try:
+        ipaddress.ip_address(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, 0))]
+    except ValueError:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+
+@pytest.fixture(autouse=True)
+def _stub_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_public_getaddrinfo)
 
 
 @pytest.fixture()

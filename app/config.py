@@ -5,8 +5,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+DEFAULT_SECRET_KEY = "change-me-to-a-random-secret"
+
 
 class Settings(BaseSettings):
+    # "development" locally by default; render.yaml sets APP_ENV=production so a
+    # real deployment fails fast (see app/main.py's create_app) if SECRET_KEY was
+    # never actually overridden, instead of silently signing admin JWTs with a
+    # value published in this repo's source.
+    app_env: str = "development"
     mesh_api_key: str | None = None
     mesh_base_url: str = "https://api.meshapi.ai/v1"
     # Benchmarked live against tencent/hy3 (free, but a "thinking" model — averaged
@@ -20,7 +27,7 @@ class Settings(BaseSettings):
     # the "real embedding model" bonus item this was added for.
     mesh_embedding_model: str = "google/embeddinggemma-300m"
     database_url: str = f"sqlite:///{PROJECT_ROOT / 'trailmind.db'}"
-    secret_key: str = "change-me-to-a-random-secret"
+    secret_key: str = DEFAULT_SECRET_KEY
     chroma_db_path: str = str(PROJECT_ROOT / "chroma_data")
     chroma_collection_name: str = "models"
     embedding_dimension: int = 64
