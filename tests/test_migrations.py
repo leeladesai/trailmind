@@ -1,10 +1,11 @@
 """P0-2: versioned database migrations.
 
-Covers: a fresh database is bootstrapped and stamped at the Alembic baseline; a
-representative pre-widget legacy database is upgraded (rename + column add/drop +
-data backfill) and then stamped; once stamped, startup never re-runs the
-hand-rolled path; and `alembic upgrade head` on the CLI reaches the same baseline
-on a brand-new database.
+Covers: a fresh database is bootstrapped and stamped at the current Alembic head
+(not a stale fixed revision — see app/db.py's _stamp_alembic_head docstring for
+why); a representative pre-widget legacy database is upgraded (rename + column
+add/drop + data backfill) and then stamped at head; once stamped, startup never
+re-runs the hand-rolled path; and `alembic upgrade head` on the CLI reaches the
+same head on a brand-new database.
 """
 
 import os
@@ -12,10 +13,26 @@ import sqlite3
 import subprocess
 import sys
 
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 
 from app.config import Settings
 from app.db import BASELINE_REVISION, build_session_factory
+
+_MIGRATIONS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations"
+)
+_ALEMBIC_INI = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "alembic.ini"
+)
+
+
+def _current_head() -> str:
+    config = AlembicConfig(_ALEMBIC_INI)
+    config.set_main_option("script_location", _MIGRATIONS_DIR)
+    script = ScriptDirectory.from_config(config)
+    return script.get_current_head()
 
 
 def _table_names(database_path) -> set[str]:
@@ -31,7 +48,20 @@ def _table_names(database_path) -> set[str]:
         conn.close()
 
 
-def test_fresh_database_is_bootstrapped_and_stamped_at_baseline(tmp_path) -> None:
+def test_baseline_revision_constant_is_the_first_migration_in_the_chain() -> None:
+    """BASELINE_REVISION is kept as a stable named reference (e.g. for docs/tests
+    that care specifically about the original schema), even though a bootstrapped
+    database is now stamped at head rather than at this revision."""
+    config = AlembicConfig(_ALEMBIC_INI)
+    config.set_main_option("script_location", _MIGRATIONS_DIR)
+    script = ScriptDirectory.from_config(config)
+    root_revisions = [rev.revision for rev in script.get_revisions("base")]
+    assert BASELINE_REVISION not in root_revisions  # "base" sentinel, not a real one
+    first_migration = script.get_revision(BASELINE_REVISION)
+    assert first_migration.down_revision is None
+
+
+def test_fresh_database_is_bootstrapped_and_stamped_at_head(tmp_path) -> None:
     db_path = tmp_path / "fresh.db"
     settings = Settings(database_url=f"sqlite:///{db_path}")
 
@@ -44,10 +74,15 @@ def test_fresh_database_is_bootstrapped_and_stamped_at_baseline(tmp_path) -> Non
 
     conn = sqlite3.connect(db_path)
     try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(catalog_items)")}
         (stamped,) = conn.execute("SELECT version_num FROM alembic_version").fetchone()
     finally:
         conn.close()
-    assert stamped == BASELINE_REVISION
+    # The columns from every migration up to head must actually be present — not
+    # just the original baseline's — since create_all always builds from *current*
+    # models.py, not from whatever the baseline migration alone describes.
+    assert "vector_index_status" in columns
+    assert stamped == _current_head()
 
 
 def test_stamped_database_skips_the_legacy_path_on_next_startup(tmp_path) -> None:
@@ -160,12 +195,12 @@ def test_legacy_pre_widget_schema_is_upgraded_and_stamped(tmp_path) -> None:
         assert "model_ids" not in rec_columns
 
         (stamped,) = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert stamped == BASELINE_REVISION
+        assert stamped == _current_head()
     finally:
         conn.close()
 
 
-def test_alembic_upgrade_head_reaches_baseline_on_a_fresh_database(tmp_path) -> None:
+def test_alembic_upgrade_head_reaches_head_on_a_fresh_database(tmp_path) -> None:
     """Proves the documented deploy-time command (`alembic upgrade head`) actually
     works end to end against a brand-new database, independent of the app's own
     startup bootstrap."""
@@ -187,4 +222,4 @@ def test_alembic_upgrade_head_reaches_baseline_on_a_fresh_database(tmp_path) -> 
         (stamped,) = conn.execute("SELECT version_num FROM alembic_version").fetchone()
     finally:
         conn.close()
-    assert stamped == BASELINE_REVISION
+    assert stamped == _current_head()

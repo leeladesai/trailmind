@@ -48,6 +48,7 @@ from app.schemas import (
     IngestionStatusResponse,
     LoginResponse,
     OnboardingStatusResponse,
+    ReindexResponse,
     ScrapeConfirmRequest,
     ScrapeConfirmResponse,
     ScrapePreviewRequest,
@@ -87,6 +88,7 @@ from app.services.catalog_import import (
     import_catalog_rows,
     parse_catalog_file,
 )
+from app.services.catalog_reconciliation import reconcile_catalog_index
 from app.services.ingestion import (
     FeedSyncError,
     ScrapeError,
@@ -239,6 +241,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # the DB. Logged so a broken seed doesn't go unnoticed.
             logging.exception("Background seed_demo_accounts failed")
 
+    def run_startup_reconciliation() -> None:
+        """P0-1: a safe startup reconciliation path that does not block /health —
+        fire-and-forget on a background thread, same pattern as run_seed above.
+        Scans every widget's approved catalog items and rebuilds any vector entry
+        that's missing (e.g. Chroma's ephemeral disk was wiped by a redeploy) or
+        was left mid-failure from a previous run."""
+        try:
+            with session_factory() as session:
+                report = reconcile_catalog_index(session, vector_store)
+                if report.failed:
+                    logging.warning(
+                        "Startup catalog reconciliation: %d failed out of %d scanned",
+                        report.failed,
+                        report.scanned,
+                    )
+                else:
+                    logging.info(
+                        "Startup catalog reconciliation: %d scanned, %d rebuilt, "
+                        "%d already synced",
+                        report.scanned,
+                        report.rebuilt,
+                        report.already_synced,
+                    )
+        except Exception:
+            # Best-effort, same reasoning as run_seed: a slow/unreachable vector
+            # store at boot must not take down request handling.
+            logging.exception("Startup catalog reconciliation failed")
+
     def run_scheduled_feed_syncs() -> None:
         """ING-1's sync cadence: sync-on-save (the manual endpoint below) plus this
         hourly sweep of every widget with a feed configured, so a feed that changes
@@ -260,11 +290,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         scheduler.add_job(run_scheduled_feed_syncs, "interval", hours=1, id="feed_sync")
+        scheduler.add_job(
+            run_startup_reconciliation,
+            "interval",
+            hours=1,
+            id="catalog_reconciliation",
+        )
         scheduler.start()
         # Fire-and-forget, not awaited: uvicorn should start accepting requests
         # (including /health) immediately rather than waiting on this — see
         # seed_demo_data's docstring for why it used to block startup entirely.
         app.state.seed_task = asyncio.create_task(asyncio.to_thread(run_seed))
+        app.state.reconciliation_task = asyncio.create_task(
+            asyncio.to_thread(run_startup_reconciliation)
+        )
         try:
             yield
         finally:
@@ -527,6 +566,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             invalid=sum(1 for row in rows if row["status"] == "invalid"),
             rows=rows,
         )
+
+    @app.post("/api/admin/widgets/{widget_id}/reindex", response_model=ReindexResponse)
+    async def reindex_widget_catalog(
+        widget_id: int, admin: User = Depends(current_admin)
+    ) -> ReindexResponse:
+        """P0-1: explicit, admin-triggered rebuild of every approved catalog item's
+        vector entry for this widget — unlike the periodic/startup reconciliation
+        pass, this forces a rebuild regardless of the item's recorded state or
+        attempt count, for when an operator already knows one is needed (e.g. after
+        restoring a persistent Chroma disk, or investigating degraded retrieval)."""
+        with session_factory() as session:
+            widget = _get_owned_widget(session, widget_id, admin)
+            report = reconcile_catalog_index(
+                session, vector_store, widget_id=widget.id, force=True
+            )
+        return ReindexResponse(**report.as_dict())
 
     @app.get(
         "/api/admin/widgets/{widget_id}/ingestion/status",

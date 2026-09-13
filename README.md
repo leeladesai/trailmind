@@ -237,6 +237,25 @@ since a downgrade that drops a column also drops its data.
 
 ---
 
+## Catalog/vector reconciliation
+
+SQL (via `CatalogItem`) is the source of truth for the catalog; Chroma is not guaranteed
+durable — on Render's free tier its disk is wiped on every redeploy (see "Free plan
+limitations" below). `app/services/catalog_reconciliation.py` scans approved catalog items
+and verifies each one's vector entry actually exists in Chroma, rebuilding it when missing,
+and only ever marks an item `vector_index_status="synced"` once the vector write itself
+succeeds — a failure is recorded (`vector_index_error`, `vector_index_attempts`) rather than
+silently left `synced`.
+
+This runs automatically and non-blockingly: once at startup (fire-and-forget, same pattern as
+demo-account seeding — it never delays `/health`) and hourly thereafter via the existing
+APScheduler job. An admin can also force an immediate rebuild for one widget's catalog via
+`POST /api/admin/widgets/{widget_id}/reindex`, which rebuilds every approved item regardless
+of its recorded state (useful right after restoring a persistent Chroma disk, or when
+investigating degraded retrieval).
+
+---
+
 ## Deploying
 
 [Render](https://render.com) is the target the backend is configured for — a persistent disk +

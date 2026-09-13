@@ -10,8 +10,10 @@ from app.config import Settings
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
 _ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
-# The baseline migration (migrations/versions/0001_baseline_schema.py) is exactly
-# the schema the hand-rolled path below produces — see BASELINE_REVISION docstring.
+# The very first migration (migrations/versions/0001_baseline_schema.py) — kept as
+# a stable, named reference point for tests and docs, distinct from "head" (see
+# _stamp_alembic_head below for why a bootstrapped database is stamped at head,
+# not literally at this revision).
 BASELINE_REVISION = "a4bb30b5eed6"
 
 
@@ -145,6 +147,10 @@ def _add_missing_columns(engine) -> None:
                 "ingestion_adapter": "VARCHAR(20) DEFAULT 'manual'",
                 "review_status": "VARCHAR(20) DEFAULT 'approved'",
                 "last_synced_at": "TIMESTAMP",
+                "vector_index_status": "VARCHAR(20) DEFAULT 'pending'",
+                "vector_index_error": "TEXT",
+                "vector_indexed_at": "TIMESTAMP",
+                "vector_index_attempts": "INTEGER DEFAULT 0",
                 "sync_stale": "BOOLEAN DEFAULT FALSE",
                 "ingestion_meta": "JSON DEFAULT '{}'",
             },
@@ -272,16 +278,24 @@ def _backfill_default_widgets(engine) -> None:
         session.commit()
 
 
-def _stamp_alembic_baseline(settings: Settings) -> None:
-    """Marks a database as Alembic-managed at the baseline revision, without
-    running any migration (the schema is already there via the hand-rolled path
-    that just ran). `alembic upgrade head` is a controlled, explicit command run
-    at deploy time (see README) — it is deliberately NOT invoked here, so startup
-    never performs uncontrolled schema mutation beyond this one-time bridge."""
+def _stamp_alembic_head(settings: Settings) -> None:
+    """Marks a database as Alembic-managed at the CURRENT head, without running any
+    migration — the schema is already there via the hand-rolled path that just ran
+    (create_all against today's Base.metadata, plus _add_missing_columns, which is
+    kept in sync with models.py the same way a new Alembic migration is: every
+    model change ships as both). Stamping at head (not the fixed baseline
+    revision) matters the moment a second migration is added — `create_all` always
+    reflects *current* models.py, so a freshly bootstrapped database already has
+    every column any migration up to head would add, not just the original
+    baseline's. Stamping it at a stale fixed revision would let `alembic upgrade
+    head` later try to re-add columns that already exist. `alembic upgrade head`
+    itself is a controlled, explicit command run at deploy time (see README) — it
+    is deliberately NOT invoked here, so startup never performs uncontrolled schema
+    mutation beyond this one-time bridge."""
     config = AlembicConfig(str(_ALEMBIC_INI))
     config.set_main_option("script_location", str(_MIGRATIONS_DIR))
     config.set_main_option("sqlalchemy.url", settings.database_url)
-    alembic_command.stamp(config, BASELINE_REVISION)
+    alembic_command.stamp(config, "head")
 
 
 def build_session_factory(settings: Settings) -> sessionmaker[Session]:
@@ -303,13 +317,14 @@ def build_session_factory(settings: Settings) -> sessionmaker[Session]:
     # (a deploy-time command, not something startup runs itself — see README's
     # migration runbook). Only a database that predates Alembic (fresh, or an
     # existing legacy deployment) falls through to the old hand-rolled path, which
-    # brings it up to exactly the baseline schema and then stamps it so this branch
-    # is never taken again for that database.
+    # brings it up to the current schema (create_all + _add_missing_columns, both
+    # tracking today's models.py) and then stamps it at head so this branch is
+    # never taken again for that database.
     if "alembic_version" not in inspect(engine).get_table_names():
         _rename_legacy_tables_and_columns(engine)
         Base.metadata.create_all(engine)
         _add_missing_columns(engine)
         _backfill_default_widgets(engine)
-        _stamp_alembic_baseline(settings)
+        _stamp_alembic_head(settings)
 
     return sessionmaker(bind=engine, autoflush=False, autocommit=False)

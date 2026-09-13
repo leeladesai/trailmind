@@ -103,7 +103,17 @@ class CatalogItem(Base):
     specs: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     use_case_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # `vector_synced` stays as a simple boolean mirror of
+    # `vector_index_status == "synced"` for every pre-existing reader (e.g.
+    # onboarding_status's catalog_ready check) — the richer state below is what the
+    # reconciliation service (app/services/catalog_reconciliation.py) actually
+    # reasons about, since a bare boolean can't distinguish "never synced yet" from
+    # "synced, then Chroma's ephemeral disk wiped it" from "actively failing."
     vector_synced: Mapped[bool] = mapped_column(Boolean, default=False)
+    vector_index_status: Mapped[str] = mapped_column(String(20), default="pending")
+    vector_index_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vector_indexed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    vector_index_attempts: Mapped[int] = mapped_column(Integer, default=0)
     # Catalog ingestion adapters (M4, docs/design plan): who/what produced this row.
     # "manual" (CAT-1..5, default — unaffected by this phase) never needs review; a
     # "feed"-sourced row is auto-approved like manual entries, while a "scrape"-sourced
