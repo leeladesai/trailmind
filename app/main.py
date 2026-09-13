@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import (
     BackgroundTasks,
@@ -102,6 +103,14 @@ from app.services.ingestion import (
     scrape_confirm,
     scrape_preview,
     sync_feed,
+)
+from app.services.scheduler_jobs import (
+    register_context,
+    run_catalog_reconciliation_job,
+    run_feed_sync_job,
+    run_retention_purge_job,
+    unregister_context,
+    upsert_scheduled_job,
 )
 from app.services.agent_graph import (
     STRONG_RETRIEVAL_DISTANCE,
@@ -239,7 +248,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # AI-engineer `user` role it iterated over is gone — app/services/digest.py stays
     # in place, unregistered, for whenever anonymous-visitor digest delivery is
     # actually specified.
-    scheduler = BackgroundScheduler()
+    #
+    # P1-5: a persistent (SQLAlchemy-backed) job store, not the default in-memory
+    # one — see app/services/scheduler_jobs.py's module docstring for why that
+    # requires the three recurring jobs to be plain module-level functions (looked
+    # up via a context registry) rather than the closures they used to be, and why
+    # that's what actually makes a restart resume the existing schedule instead of
+    # silently resetting it.
+    scheduler = BackgroundScheduler(
+        jobstores={"default": SQLAlchemyJobStore(engine=session_factory.kw["bind"])},
+        job_defaults={
+            # Generous on purpose: a Render free-tier instance can be asleep for a
+            # while, and coalesce=True (the APScheduler default, set explicitly here
+            # for clarity) collapses any backlog of missed runs into one, so a long
+            # grace window just means "still run it once on wake," never "run it N
+            # times to catch up."
+            "misfire_grace_time": 3600,
+            "coalesce": True,
+            "max_instances": 1,
+        },
+    )
+    scheduler_context_id = register_context(session_factory, vector_store, app_settings)
 
     def run_seed() -> None:
         try:
@@ -255,99 +284,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # the DB. Logged so a broken seed doesn't go unnoticed.
             logging.exception("Background seed_demo_accounts failed")
 
-    def run_startup_reconciliation() -> None:
-        """P0-1: a safe startup reconciliation path that does not block /health —
-        fire-and-forget on a background thread, same pattern as run_seed above.
-        Scans every widget's approved catalog items and rebuilds any vector entry
-        that's missing (e.g. Chroma's ephemeral disk was wiped by a redeploy) or
-        was left mid-failure from a previous run."""
-        try:
-            with session_factory() as session:
-                report = reconcile_catalog_index(session, vector_store)
-                if report.failed:
-                    logging.warning(
-                        "Startup catalog reconciliation: %d failed out of %d scanned",
-                        report.failed,
-                        report.scanned,
-                    )
-                else:
-                    logging.info(
-                        "Startup catalog reconciliation: %d scanned, %d rebuilt, "
-                        "%d already synced",
-                        report.scanned,
-                        report.rebuilt,
-                        report.already_synced,
-                    )
-        except Exception:
-            # Best-effort, same reasoning as run_seed: a slow/unreachable vector
-            # store at boot must not take down request handling.
-            logging.exception("Startup catalog reconciliation failed")
-
-    def run_scheduled_feed_syncs() -> None:
-        """ING-1's sync cadence: sync-on-save (the manual endpoint below) plus this
-        hourly sweep of every widget with a feed configured, so a feed that changes
-        upstream without an admin manually re-triggering still stays current. Scoped
-        per widget now, not per tenant — two widgets under the same tenant can sync
-        from two different feeds (see Widget's docstring)."""
-        with session_factory() as session:
-            widgets = session.scalars(
-                select(Widget).where(Widget.feed_url.is_not(None))
-            ).all()
-            for widget in widgets:
-                try:
-                    sync_feed(session, vector_store, widget)
-                except FeedSyncError:
-                    logging.warning(
-                        "Scheduled feed sync failed for widget_id=%s", widget.id
-                    )
-
-    def run_scheduled_retention_purge() -> None:
-        """P1-3: daily sweep purging Event/Recommendation/WidgetSession rows older
-        than Settings.event_retention_days, across every tenant. Best-effort, same
-        fire-and-forget reasoning as run_seed/run_startup_reconciliation above — a
-        slow/unreachable DB on this pass must not take down request handling."""
-        try:
-            with session_factory() as session:
-                report = purge_expired_visitor_data(
-                    session, retention_days=app_settings.event_retention_days
-                )
-                logging.info(
-                    "Scheduled retention purge: %d events, %d recommendations, "
-                    "%d widget_sessions deleted",
-                    report.events_deleted,
-                    report.recommendations_deleted,
-                    report.widget_sessions_deleted,
-                )
-        except Exception:
-            logging.exception("Scheduled retention purge failed")
-
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        scheduler.add_job(run_scheduled_feed_syncs, "interval", hours=1, id="feed_sync")
-        scheduler.add_job(
-            run_startup_reconciliation,
-            "interval",
-            hours=1,
-            id="catalog_reconciliation",
-        )
-        scheduler.add_job(
-            run_scheduled_retention_purge,
-            "interval",
-            hours=24,
-            id="retention_purge",
-        )
         scheduler.start()
+        upsert_scheduled_job(
+            scheduler,
+            "feed_sync",
+            run_feed_sync_job,
+            scheduler_context_id,
+            trigger="interval",
+            hours=1,
+        )
+        upsert_scheduled_job(
+            scheduler,
+            "catalog_reconciliation",
+            run_catalog_reconciliation_job,
+            scheduler_context_id,
+            trigger="interval",
+            hours=1,
+        )
+        upsert_scheduled_job(
+            scheduler,
+            "retention_purge",
+            run_retention_purge_job,
+            scheduler_context_id,
+            trigger="interval",
+            hours=24,
+        )
         # Fire-and-forget, not awaited: uvicorn should start accepting requests
         # (including /health) immediately rather than waiting on this — see
         # seed_demo_data's docstring for why it used to block startup entirely.
         app.state.seed_task = asyncio.create_task(asyncio.to_thread(run_seed))
         app.state.reconciliation_task = asyncio.create_task(
-            asyncio.to_thread(run_startup_reconciliation)
+            asyncio.to_thread(run_catalog_reconciliation_job, scheduler_context_id)
         )
         try:
             yield
         finally:
             scheduler.shutdown(wait=False)
+            unregister_context(scheduler_context_id)
 
     app = FastAPI(
         title="TrailMind",

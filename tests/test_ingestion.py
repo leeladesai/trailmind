@@ -19,6 +19,7 @@ from app.services.ingestion import (
     scrape_confirm,
     scrape_preview,
     sync_feed,
+    sync_feed_with_retry,
 )
 from app.services.widgets import configure_feed, create_widget
 
@@ -116,6 +117,52 @@ def test_feed_sync_marks_existing_rows_stale_on_failure(
 
         item = session.query(CatalogItem).filter_by(title="Feed Item One").one()
         assert item.sync_stale is True
+
+
+def test_sync_feed_with_retry_succeeds_after_transient_failures(
+    client, reference_widget, monkeypatch
+) -> None:
+    """P1-5: the scheduled sweep (unlike the manual sync endpoint) is worth
+    retrying a couple of times before giving up on a transient fetch failure."""
+    widget, _ = reference_widget
+    monkeypatch.setattr(ingestion_module.time, "sleep", lambda _seconds: None)
+    attempts = {"count": 0}
+
+    def flaky_get(url, headers=None, timeout=None, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise httpx.ConnectError("network down")
+        return _FakeResponse(content=FEED_JSON)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", flaky_get)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        rows = sync_feed_with_retry(session, client.app.state.vector_store, widget_row)
+        assert rows[0]["status"] == "inserted"
+    assert attempts["count"] == 3
+
+
+def test_sync_feed_with_retry_gives_up_after_max_attempts(
+    client, reference_widget, monkeypatch
+) -> None:
+    widget, _ = reference_widget
+    monkeypatch.setattr(ingestion_module.time, "sleep", lambda _seconds: None)
+    attempts = {"count": 0}
+
+    def always_fails(url, headers=None, timeout=None, **_kwargs):
+        attempts["count"] += 1
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", always_fails)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        with pytest.raises(FeedSyncError):
+            sync_feed_with_retry(
+                session, client.app.state.vector_store, widget_row, max_attempts=3
+            )
+    assert attempts["count"] == 3
 
 
 def test_scrape_preview_extracts_json_ld_product(client, monkeypatch) -> None:

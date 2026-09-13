@@ -11,6 +11,7 @@ the same tenant can sync from two different feeds.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -174,6 +175,36 @@ def sync_feed(
     _reconcile_removed_feed_rows(session, vector_store, widget, raw_rows)
     _set_feed_rows_stale(session, widget.id, False)
     return results
+
+
+def sync_feed_with_retry(
+    session: Session,
+    vector_store: CatalogItemVectorStore,
+    widget: Widget,
+    *,
+    max_attempts: int = 3,
+    backoff_seconds: float = 2.0,
+) -> list[dict]:
+    """P1-5: bounded retry with exponential backoff around `sync_feed`, for the
+    unattended scheduled sweep only — a manual admin-triggered sync
+    (POST .../feed/sync) deliberately calls `sync_feed` directly and fails fast, since
+    there's a real request (and a real admin) waiting on the response; the scheduled
+    sweep has no one waiting, so it's worth absorbing a transient fetch hiccup (a
+    momentary DNS blip, a 5xx) before falling back to `sync_stale=True` for real.
+    Retrying an unsafe-URL or unparseable-feed failure is pointless (the same input
+    will fail identically every time), but harmless — it just burns a couple of wasted
+    attempts before giving up with the same error either way.
+    """
+    last_error: FeedSyncError | None = None
+    for attempt in range(max_attempts):
+        try:
+            return sync_feed(session, vector_store, widget)
+        except FeedSyncError as exc:
+            last_error = exc
+            if attempt < max_attempts - 1:
+                time.sleep(backoff_seconds * (2**attempt))
+    assert last_error is not None
+    raise last_error
 
 
 def _extract_json_ld_products(soup: BeautifulSoup) -> list[dict]:
