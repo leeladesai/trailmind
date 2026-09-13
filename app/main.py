@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import secrets
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,9 +23,9 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.config import DEFAULT_SECRET_KEY, Settings
@@ -112,6 +114,7 @@ from app.services.scheduler_jobs import (
     unregister_context,
     upsert_scheduled_job,
 )
+from app.services.telemetry import RequestMetrics, configure_logging, request_id_var
 from app.services.agent_graph import (
     STRONG_RETRIEVAL_DISTANCE,
     WEAK_RETRIEVAL_DISTANCE,
@@ -204,6 +207,7 @@ def as_utc(value):
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    configure_logging()
     app_settings = settings or Settings()
     if (
         app_settings.app_env == "production"
@@ -338,12 +342,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.scheduler = scheduler
     app.state.pipeline_locks = {}
     app.state.pipeline_locks_guard = asyncio.Lock()
+    app.state.request_metrics = RequestMetrics()
     # DLV-2: (widget_id, visitor_id) -> list of open SSE connections' asyncio.Queue.
     # In-process only (no Redis/pub-sub) — consistent with this repo's other
     # single-process-deployment choices (pipeline_locks above, the TEN-6 rate cap);
-    # a multi-worker deploy would need this revisited. Keyed by widget_id (not
-    # tenant_id) now — the per-widget key cutover moved every auth/retrieval scope
-    # one level deeper (see Widget's docstring in app/models.py).
+    # a multi-worker deploy would need this revisited. This is deliberately deferred,
+    # not an oversight: the current deploy target (render.yaml) is a single free-tier
+    # instance, so there is exactly one process for this dict to ever live in, and
+    # adding a pub/sub layer now would be unused complexity until a second instance
+    # is actually provisioned. Keyed by widget_id (not tenant_id) now — the
+    # per-widget key cutover moved every auth/retrieval scope one level deeper (see
+    # Widget's docstring in app/models.py).
     app.state.widget_connections = {}
     app.state.widget_connections_guard = asyncio.Lock()
     # Permissive at the CORSMiddleware layer on purpose — the tracker SDK and widget
@@ -361,6 +370,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def correlate_and_measure_requests(request: Request, call_next):
+        """P1-6: an inbound X-Request-ID is honored (so a caller's own trace id
+        threads through our logs), otherwise a fresh one is minted per request.
+        `request_id_var` (app/services/telemetry.py) makes it available to every log
+        line emitted anywhere during this request's handling without threading a
+        request object through every function signature — safe across concurrent
+        requests because contextvars are per-asyncio-task, and this coroutine awaits
+        `call_next` directly rather than spawning a separate task."""
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+        token = request_id_var.set(request_id)
+        start = time.monotonic()
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+        duration_seconds = time.monotonic() - start
+        # The route's path *template* (e.g. "/api/widgets/{widget_id}"), not the raw
+        # URL, keeps /metrics cardinality bounded regardless of how many distinct
+        # widget/tenant ids get requested — only set once routing has matched, hence
+        # reading it from request.scope after call_next rather than before.
+        route = request.scope.get("route")
+        path_template = getattr(route, "path", request.url.path)
+        app.state.request_metrics.record(
+            request.method, path_template, response.status_code, duration_seconds
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+
     # Still needed for tracker.js/widget.js — the embeddable SDK a tenant's own site
     # loads. The admin console itself moved to the separate React app (frontend/);
     # this backend no longer serves any HTML of its own.
@@ -376,6 +415,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # cross-origin while the Render free-tier instance wakes from sleep.
         response.headers["Access-Control-Allow-Origin"] = "*"
         return {"status": "ok", "service": "trailmind"}
+
+    @app.get("/ready")
+    async def ready(response: Response) -> dict:
+        """P1-6: unlike /health (a liveness probe — "is the process up at all"),
+        this actually exercises the dependencies a request needs to succeed: the
+        database, the vector store, and the background scheduler. A deploy platform
+        gating traffic on readiness should point at this endpoint, not /health."""
+        checks: dict[str, str] = {}
+        healthy = True
+
+        try:
+            with session_factory() as session:
+                session.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        except Exception:
+            logging.exception("Readiness check: database unreachable")
+            checks["database"] = "error"
+            healthy = False
+
+        try:
+            vector_store.client.heartbeat()
+            checks["vector_store"] = "ok"
+        except Exception:
+            logging.exception("Readiness check: vector store unreachable")
+            checks["vector_store"] = "error"
+            healthy = False
+
+        checks["scheduler"] = "ok" if scheduler.running else "error"
+        healthy = healthy and scheduler.running
+
+        if not healthy:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "ok" if healthy else "error", "checks": checks}
+
+    @app.get("/metrics")
+    async def metrics() -> PlainTextResponse:
+        """P1-6: basic per-route request counts and cumulative latency, in
+        Prometheus text exposition format — no prometheus_client dependency, since
+        a handful of counters this simple don't need one (see telemetry.py)."""
+        return PlainTextResponse(
+            app.state.request_metrics.render_prometheus_text(),
+            media_type="text/plain; version=0.0.4",
+        )
 
     @app.post("/api/admin/login", response_model=LoginResponse)
     async def admin_login(
