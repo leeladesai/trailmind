@@ -99,6 +99,9 @@ class AgentState(TypedDict, total=False):
     mesh_prompt_tokens: int | None
     mesh_completion_tokens: int | None
     mesh_cost_usd: float | None
+    mesh_model: str | None
+    mesh_raw_prompt: str | None
+    mesh_raw_response: str | None
     short_circuit: bool
     recommendation: Recommendation | None
 
@@ -431,6 +434,9 @@ def _generate_narrative(session: Session, mesh_generator):
         mesh_prompt_tokens: int | None = None
         mesh_completion_tokens: int | None = None
         mesh_cost_usd: float | None = None
+        mesh_model: str | None = None
+        mesh_raw_prompt: str | None = None
+        mesh_raw_response: str | None = None
         if mesh_generator is not None and mesh_generator.enabled and ordered_ids:
             candidates = [
                 {
@@ -462,6 +468,9 @@ def _generate_narrative(session: Session, mesh_generator):
                     mesh_prompt_tokens = result.prompt_tokens
                     mesh_completion_tokens = result.completion_tokens
                     mesh_cost_usd = result.cost_usd
+                    mesh_model = result.model
+                    mesh_raw_prompt = result.raw_prompt
+                    mesh_raw_response = result.raw_response
                 elif isinstance(result, dict):
                     narrative = str(result.get("narrative", ""))
                     generated_ids = result.get("catalog_item_ids", [])
@@ -503,6 +512,9 @@ def _generate_narrative(session: Session, mesh_generator):
             "mesh_prompt_tokens": mesh_prompt_tokens,
             "mesh_completion_tokens": mesh_completion_tokens,
             "mesh_cost_usd": mesh_cost_usd,
+            "mesh_model": mesh_model,
+            "mesh_raw_prompt": mesh_raw_prompt,
+            "mesh_raw_response": mesh_raw_response,
         }
 
     return node
@@ -522,6 +534,9 @@ def _store_and_deliver(session: Session, push_callback=None):
             mesh_prompt_tokens=state.get("mesh_prompt_tokens"),
             mesh_completion_tokens=state.get("mesh_completion_tokens"),
             mesh_cost_usd=state.get("mesh_cost_usd"),
+            mesh_model=state.get("mesh_model"),
+            mesh_raw_prompt=state.get("mesh_raw_prompt"),
+            mesh_raw_response=state.get("mesh_raw_response"),
             behavior_summary=state["behavior_summary"],
             activity_hash=state["activity_hash"],
             trigger_reason=state["trigger_reason"],

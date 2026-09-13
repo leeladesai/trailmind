@@ -248,6 +248,14 @@ class Recommendation(Base):
     mesh_prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mesh_completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mesh_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # P1-4 auditability: exact model + wire messages/response for this generation,
+    # captured directly from the Mesh call (app/services/mesh.py) — LangSmith tracing
+    # is opt-in and off by default, so this is the only durable record of what was
+    # actually sent/returned unless tracing happens to be on. Null under the same
+    # conditions mesh_latency_ms is null (no Mesh configured, retrieval-only).
+    mesh_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    mesh_raw_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mesh_raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     # DLV-2: set when this recommendation was actually pushed to an open
     # `/api/widget/stream` connection at generation time — null means either no
     # connection was open (the visitor picks it up via GET /api/recommendations/latest
