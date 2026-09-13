@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     # than linking to a localhost address nobody outside the dev machine can reach.
     app_base_url: str | None = None
 
+    # P1-3: visitor data retention. Event/Recommendation/WidgetSession rows older
+    # than this are purged by the scheduled retention job (app/services/retention.py)
+    # — see that module's docstring for why a hard delete is safe here (nothing has
+    # a foreign key into any of the three).
+    event_retention_days: int = 90
+
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",

@@ -50,6 +50,7 @@ from app.schemas import (
     LoginResponse,
     OnboardingStatusResponse,
     ReindexResponse,
+    RetentionPurgeResponse,
     ScrapeConfirmRequest,
     ScrapeConfirmResponse,
     ScrapePreviewRequest,
@@ -93,6 +94,7 @@ from app.services.catalog_import import (
     parse_catalog_file,
 )
 from app.services.catalog_reconciliation import reconcile_catalog_index
+from app.services.retention import purge_expired_visitor_data
 from app.services.ingestion import (
     FeedSyncError,
     ScrapeError,
@@ -299,6 +301,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "Scheduled feed sync failed for widget_id=%s", widget.id
                     )
 
+    def run_scheduled_retention_purge() -> None:
+        """P1-3: daily sweep purging Event/Recommendation/WidgetSession rows older
+        than Settings.event_retention_days, across every tenant. Best-effort, same
+        fire-and-forget reasoning as run_seed/run_startup_reconciliation above — a
+        slow/unreachable DB on this pass must not take down request handling."""
+        try:
+            with session_factory() as session:
+                report = purge_expired_visitor_data(
+                    session, retention_days=app_settings.event_retention_days
+                )
+                logging.info(
+                    "Scheduled retention purge: %d events, %d recommendations, "
+                    "%d widget_sessions deleted",
+                    report.events_deleted,
+                    report.recommendations_deleted,
+                    report.widget_sessions_deleted,
+                )
+        except Exception:
+            logging.exception("Scheduled retention purge failed")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         scheduler.add_job(run_scheduled_feed_syncs, "interval", hours=1, id="feed_sync")
@@ -307,6 +329,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "interval",
             hours=1,
             id="catalog_reconciliation",
+        )
+        scheduler.add_job(
+            run_scheduled_retention_purge,
+            "interval",
+            hours=24,
+            id="retention_purge",
         )
         scheduler.start()
         # Fire-and-forget, not awaited: uvicorn should start accepting requests
@@ -1312,6 +1340,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 target_type="user",
                 target_id=user_id,
             )
+
+    @app.post("/api/admin/retention/purge", response_model=RetentionPurgeResponse)
+    async def trigger_retention_purge(
+        admin: User = Depends(current_admin),
+    ) -> RetentionPurgeResponse:
+        """P1-3: explicit, admin-triggered purge of this tenant's Event/
+        Recommendation/WidgetSession rows older than Settings.event_retention_days
+        — for an operator who wants to confirm the policy is applied right now
+        rather than waiting on the daily scheduled sweep (see
+        run_scheduled_retention_purge above, which covers every tenant)."""
+        with session_factory() as session:
+            report = purge_expired_visitor_data(
+                session,
+                retention_days=app_settings.event_retention_days,
+                tenant_id=admin.tenant_id,
+            )
+            record_audit_event(
+                session,
+                action="retention_purge_triggered",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="tenant",
+                target_id=admin.tenant_id,
+                details=report.as_dict(),
+            )
+        return RetentionPurgeResponse(**report.as_dict())
 
     @app.get("/api/admin/observability/costs")
     async def observability_costs(

@@ -103,6 +103,12 @@ class ReindexResponse(BaseModel):
     errors: list[str]
 
 
+class RetentionPurgeResponse(BaseModel):
+    events_deleted: int
+    recommendations_deleted: int
+    widget_sessions_deleted: int
+
+
 class ScrapePreviewRequest(BaseModel):
     url: HttpUrl
     selectors: dict[str, str] = Field(default_factory=dict)
