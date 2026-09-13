@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.db import build_session_factory
@@ -125,11 +126,14 @@ from app.services.tenants import (
 )
 from app.services.tracing import configure_langsmith
 from app.services.widgets import (
+    ACTIVE_WIDGET_STATUSES,
+    INGESTION_WIDGET_STATUSES,
+    WidgetAuthError,
     configure_feed,
     create_widget,
     onboarding_status as widget_onboarding_status,
     reactivate_widget,
-    resolve_widget_by_api_key,
+    resolve_authorized_widget,
     revoke_api_key,
     rotate_api_key,
     suspend_widget,
@@ -140,10 +144,13 @@ from seed_data import seed_demo_accounts
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BULK_UPLOAD_MAX_BYTES = 2 * 1024 * 1024  # plenty for a few hundred catalog rows
-# TEN-1/TEN-8: a widget only actually renders when its own tenant is in good standing
-# too — a suspended/rejected/still-pending-approval tenant must dark out every widget
-# under it, not just ones an admin remembered to suspend individually.
-WIDGET_BLOCKING_TENANT_STATUSES = {"suspended", "rejected", "pending_approval"}
+
+_WIDGET_AUTH_STATUS_CODES = {
+    "invalid_key": 401,
+    "origin_not_allowed": 403,
+    "widget_not_active": 403,
+    "tenant_not_active": 403,
+}
 
 
 def catalog_item_response(item: CatalogItem) -> CatalogItemResponse:
@@ -1102,16 +1109,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ],
         }
 
-    def _origin_allowed(widget: Widget, request: Request) -> bool:
-        """Soft, browser-only defense (docs/design/09-Platform-Pivot-Decision.md §5)
-        — an empty `allowed_origins` means "not configured", so every origin is
-        allowed rather than every request being rejected. A non-browser client can
-        always spoof `Origin`/`Referer`; the widget key is the real boundary, this
-        only stops the most naive cross-site misuse from a real browser."""
-        if not widget.allowed_origins:
-            return True
-        origin = request.headers.get("origin") or request.headers.get("referer") or ""
-        return any(origin.startswith(allowed) for allowed in widget.allowed_origins)
+    def _request_origin(request: Request) -> str:
+        return request.headers.get("origin") or request.headers.get("referer") or ""
+
+    def _authorize_widget(
+        session: Session,
+        raw_key: str,
+        request: Request,
+        *,
+        allowed_widget_statuses: frozenset[str] = ACTIVE_WIDGET_STATUSES,
+    ) -> Widget:
+        """The single authorization path for every widget-facing endpoint (tracking
+        ingestion, latest-recommendation polling, SSE stream, widget Q&A, widget
+        activity) — see resolve_authorized_widget's docstring for the policy itself.
+        Translates WidgetAuthError into the matching HTTP status here, at the
+        framework boundary, rather than in the (framework-agnostic) service layer."""
+        try:
+            return resolve_authorized_widget(
+                session,
+                raw_key,
+                _request_origin(request),
+                allowed_widget_statuses=allowed_widget_statuses,
+            )
+        except WidgetAuthError as exc:
+            raise HTTPException(
+                status_code=_WIDGET_AUTH_STATUS_CODES[exc.code], detail=exc.message
+            ) from exc
+
+    def _resolve_widget(widget_key: str, request: Request) -> Widget:
+        """Thin wrapper for the three endpoints that resolve the widget in its own
+        short-lived session and hand back a detached `Widget` for a second session
+        to do the actual work in (SSE stream, widget Q&A, widget activity)."""
+        with session_factory() as session:
+            widget = _authorize_widget(session, widget_key, request)
+            session.expunge(widget)
+            return widget
 
     async def _get_visitor_lock(widget_id: int, visitor_id: str) -> asyncio.Lock:
         key = (widget_id, visitor_id)
@@ -1201,11 +1233,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session; identity is an anonymous, client-generated `visitor_id`, not a
         `User` row."""
         with session_factory() as session:
-            widget = resolve_widget_by_api_key(session, batch.widget_key)
-            if widget is None:
-                raise HTTPException(status_code=401, detail="Invalid widget key")
-            if not _origin_allowed(widget, request):
-                raise HTTPException(status_code=403, detail="Origin not allowed")
+            widget = _authorize_widget(
+                session,
+                batch.widget_key,
+                request,
+                allowed_widget_statuses=INGESTION_WIDGET_STATUSES,
+            )
 
             # A catalog_item_id that doesn't belong to this widget is dropped rather
             # than stored — an event referencing another widget's catalog item id
@@ -1274,16 +1307,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/recommendations/latest")
     async def latest_recommendation_for_visitor(
+        request: Request,
         widget_key: str = Query(...),
         visitor_id: str = Query(...),
     ) -> dict[str, object]:
         """Read fallback for when no real-time push connection is open — same
-        widget-key authentication as ingestion, no separate widget-session mechanism
-        yet."""
+        widget authorization policy as every other widget-facing endpoint (key,
+        origin, widget status, tenant status; see resolve_authorized_widget)."""
         with session_factory() as session:
-            widget = resolve_widget_by_api_key(session, widget_key)
-            if widget is None:
-                raise HTTPException(status_code=401, detail="Invalid widget key")
+            widget = _authorize_widget(session, widget_key, request)
 
             latest = session.scalar(
                 select(Recommendation)
@@ -1383,25 +1415,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "trigger_reason": "activity_retrieval",
                 "evidence": evidence_payload,
             }
-
-    def _resolve_widget(widget_key: str, request: Request) -> Widget:
-        """Shared auth for every /api/widget/* route: resolves the widget key, checks
-        the soft origin allowlist, and enforces TEN-8's render-gate — a widget must
-        stay dark on the host page until it's verified + catalog-ready AND its parent
-        tenant is in good standing, not just have a valid key."""
-        with session_factory() as session:
-            widget = resolve_widget_by_api_key(session, widget_key)
-            if widget is None:
-                raise HTTPException(status_code=401, detail="Invalid widget key")
-            if not _origin_allowed(widget, request):
-                raise HTTPException(status_code=403, detail="Origin not allowed")
-            if widget.status != "active":
-                raise HTTPException(status_code=403, detail="Widget not active")
-            tenant = session.get(Tenant, widget.tenant_id)
-            if tenant is None or tenant.status in WIDGET_BLOCKING_TENANT_STATUSES:
-                raise HTTPException(status_code=403, detail="Tenant not active")
-            session.expunge(widget)
-            return widget
 
     @app.get("/api/widget/stream")
     async def widget_stream(

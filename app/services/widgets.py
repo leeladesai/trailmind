@@ -20,6 +20,33 @@ DEFAULT_WIDGET_NAME = "Default"
 # (cached HTML/CDN) doesn't start failing the instant a key rotates.
 KEY_ROTATION_GRACE = timedelta(hours=24)
 
+# TEN-8's render-gate: a widget must be verified + catalog-ready AND its parent
+# tenant in good standing before any widget-facing endpoint other than tracking
+# ingestion will serve it. Ingestion is the one exception — see
+# INGESTION_WIDGET_STATUSES below.
+ACTIVE_WIDGET_STATUSES = frozenset({"active"})
+# Tracking ingestion is what flips a widget from "onboarding" to "active" in the
+# first place (onboarding_status's tracker_verified needs a real event through
+# POST /api/track/events) — rejecting onboarding widgets here would make onboarding
+# impossible. `suspended` is still rejected: a manual suspend must take effect
+# immediately, even mid-onboarding.
+INGESTION_WIDGET_STATUSES = frozenset({"active", "onboarding"})
+WIDGET_BLOCKING_TENANT_STATUSES = frozenset(
+    {"suspended", "rejected", "pending_approval"}
+)
+
+
+class WidgetAuthError(Exception):
+    """Raised by `resolve_authorized_widget` for every rejection reason — kept
+    framework-agnostic (no HTTPException here) so this module has no FastAPI
+    dependency and the policy itself is unit-testable in isolation. Callers at the
+    HTTP boundary (app/main.py) map `code` to a status code."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
 
 def hash_api_key(raw_key: str) -> str:
     # Same reasoning as the retired TenantApiKey.hash_api_key: this is a public,
@@ -129,6 +156,42 @@ def resolve_widget_by_api_key(session: Session, raw_key: str) -> Widget | None:
     ):
         return None
     return session.get(Widget, api_key.widget_id)
+
+
+def origin_allowed(widget: Widget, origin: str) -> bool:
+    """Soft, browser-only defense (docs/design/09-Platform-Pivot-Decision.md §5)
+    — an empty `allowed_origins` means "not configured", so every origin is
+    allowed rather than every request being rejected. A non-browser client can
+    always spoof `Origin`/`Referer`; the widget key is the real boundary, this
+    only stops the most naive cross-site misuse from a real browser."""
+    if not widget.allowed_origins:
+        return True
+    return any(origin.startswith(allowed) for allowed in widget.allowed_origins)
+
+
+def resolve_authorized_widget(
+    session: Session,
+    raw_key: str,
+    origin: str,
+    *,
+    allowed_widget_statuses: frozenset[str] = ACTIVE_WIDGET_STATUSES,
+) -> Widget:
+    """The single authorization policy for every widget-facing endpoint: valid key,
+    allowed origin, widget status, and tenant status, in that order (so the most
+    specific reason always wins — an unknown key never gets a "tenant not active"
+    style leak). `allowed_widget_statuses` is the only axis that legitimately
+    differs by endpoint — see INGESTION_WIDGET_STATUSES."""
+    widget = resolve_widget_by_api_key(session, raw_key)
+    if widget is None:
+        raise WidgetAuthError("invalid_key", "Invalid widget key")
+    if not origin_allowed(widget, origin):
+        raise WidgetAuthError("origin_not_allowed", "Origin not allowed")
+    if widget.status not in allowed_widget_statuses:
+        raise WidgetAuthError("widget_not_active", "Widget not active")
+    tenant = session.get(Tenant, widget.tenant_id)
+    if tenant is None or tenant.status in WIDGET_BLOCKING_TENANT_STATUSES:
+        raise WidgetAuthError("tenant_not_active", "Tenant not active")
+    return widget
 
 
 def onboarding_status(session: Session, widget: Widget) -> dict:
