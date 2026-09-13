@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.db import build_session_factory
 from app.models import (
+    AuditLog,
     CatalogItem,
     Event,
     Recommendation,
@@ -66,11 +67,14 @@ from app.schemas import (
     WidgetResponse,
 )
 from app.security import (
+    SESSION_LIFETIME,
     create_session_token,
     hash_password,
     make_role_dependency,
+    revoke_current_session,
     verify_password,
 )
+from app.services.audit import record_audit_event
 from app.services.admin_overview import (
     event_type_counts,
     feedback_sentiment,
@@ -389,18 +393,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         status_code=403,
                         detail="This account's signup request was not approved.",
                     )
-            token = create_session_token(user, app_settings)
-            # The React admin frontend reads `token` from the response body and sends
-            # it back as a bearer token (see app/security.py's get_current_user) — the
-            # cookie is set alongside it only for anything still relying on that path
-            # during the frontend migration.
+            token = create_session_token(session, user, app_settings)
+            # P0-4: the HttpOnly/Secure/SameSite cookie is the real, hardened
+            # session mechanism — a JS-readable bearer token in the response body
+            # is still returned only for backward compatibility with any client
+            # still storing/sending it manually (see AuthContext.tsx's migration to
+            # credentialed cookie requests); nothing about the token's own
+            # long-lived-bearer risk changes for whoever still uses that path.
             response.set_cookie(
                 app_settings.session_cookie_name,
                 token,
                 httponly=True,
                 samesite="lax",
                 secure=app_settings.session_cookie_secure,
-                max_age=60 * 60 * 12,
+                max_age=int(SESSION_LIFETIME.total_seconds()),
+            )
+            record_audit_event(
+                session,
+                action="admin_login",
+                actor_user_id=user.id,
+                tenant_id=user.tenant_id,
+                target_type="user",
+                target_id=user.id,
             )
             return LoginResponse(
                 id=user.id,
@@ -438,7 +452,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
     @app.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
-    async def logout(response: Response) -> None:
+    async def logout(request: Request, response: Response) -> None:
+        # P0-4: revoke the session server-side (see AdminSession/revoke_session),
+        # not just delete the cookie client-side — a bearer token copied out of the
+        # response body before this point would otherwise keep working for the
+        # rest of its 12-hour lifetime even after "logging out."
+        with session_factory() as session:
+            revoke_current_session(request, session, app_settings)
         response.delete_cookie(app_settings.session_cookie_name)
 
     @app.get("/api/admin/me", response_model=UserResponse)
@@ -497,6 +517,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             raw_key = rotate_api_key(session, widget)
+            record_audit_event(
+                session,
+                action="widget_key_rotated",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget",
+                target_id=widget.id,
+            )
             return ApiKeyResponse(api_key=raw_key)
 
     @app.post(
@@ -512,6 +540,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not key or key.widget_id != widget_id:
                 raise HTTPException(status_code=404, detail="Key not found")
             revoke_api_key(session, key_id)
+            record_audit_event(
+                session,
+                action="widget_key_revoked",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget_api_key",
+                target_id=key_id,
+                details={"widget_id": widget_id},
+            )
 
     @app.post(
         "/api/admin/widgets/{widget_id}/suspend",
@@ -523,6 +560,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             suspend_widget(session, widget)
+            record_audit_event(
+                session,
+                action="widget_suspended",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget",
+                target_id=widget.id,
+            )
 
     @app.post(
         "/api/admin/widgets/{widget_id}/reactivate",
@@ -534,6 +579,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             reactivate_widget(session, widget)
+            record_audit_event(
+                session,
+                action="widget_reactivated",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget",
+                target_id=widget.id,
+            )
 
     @app.post("/api/admin/widgets/{widget_id}/feed")
     async def set_feed_config(
@@ -735,6 +788,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             item = create_catalog_item_service(session, vector_store, widget, payload)
+            record_audit_event(
+                session,
+                action="catalog_item_created",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=item.id,
+                details={"widget_id": widget_id},
+            )
             return catalog_item_response(item)
 
     @app.put(
@@ -751,6 +813,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _get_owned_widget(session, widget_id, admin)
             item = _get_owned_catalog_item(session, widget_id, catalog_item_id)
             update_catalog_item_service(session, vector_store, widget_id, item, payload)
+            record_audit_event(
+                session,
+                action="catalog_item_updated",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=catalog_item_id,
+                details={"widget_id": widget_id},
+            )
             return catalog_item_response(item)
 
     @app.delete(
@@ -764,6 +835,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _get_owned_widget(session, widget_id, admin)
             item = _get_owned_catalog_item(session, widget_id, catalog_item_id)
             delete_catalog_item_service(session, vector_store, widget_id, item)
+            record_audit_event(
+                session,
+                action="catalog_item_deleted",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=catalog_item_id,
+                details={"widget_id": widget_id},
+            )
 
     @app.post(
         "/api/admin/widgets/{widget_id}/catalog-items/bulk-upload",
@@ -804,6 +884,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _get_owned_widget(session, widget_id, admin)
             item = _get_owned_catalog_item(session, widget_id, catalog_item_id)
             approve_catalog_item_service(session, vector_store, widget_id, item)
+            record_audit_event(
+                session,
+                action="catalog_item_approved",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=catalog_item_id,
+                details={"widget_id": widget_id},
+            )
             return catalog_item_response(item)
 
     @app.post(
@@ -853,6 +942,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> TenantCreateResponse:
         with session_factory() as session:
             tenant = create_tenant(session, payload.name)
+            record_audit_event(
+                session,
+                action="tenant_created",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
             return TenantCreateResponse(
                 id=tenant.id, name=tenant.name, status=tenant.status
             )
@@ -923,6 +1020,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             suspend_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_suspended",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
 
     @app.post(
         "/api/tenants/{tenant_id}/reactivate", status_code=status.HTTP_204_NO_CONTENT
@@ -935,6 +1040,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             reactivate_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_reactivated",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
 
     @app.post(
         "/api/tenants/{tenant_id}/approve", status_code=status.HTTP_204_NO_CONTENT
@@ -947,6 +1060,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             approve_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_approved",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
 
     @app.post("/api/tenants/{tenant_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
     async def reject_tenant_endpoint(
@@ -957,6 +1078,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             reject_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_rejected",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
+
+    @app.get("/api/admin/audit-log")
+    async def audit_log(
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        staff: User = Depends(current_staff),
+    ) -> dict[str, object]:
+        """P0-4: read access to the audit trail — a tenant-scoped `admin` only ever
+        sees their own tenant's entries (including platform-level actions taken on
+        it, e.g. suspension); `platform_admin` sees every tenant's, since a
+        platform-level action itself has no single tenant scope."""
+        with session_factory() as session:
+            query = select(AuditLog).order_by(
+                AuditLog.created_at.desc(), AuditLog.id.desc()
+            )
+            if staff.role != "platform_admin":
+                query = query.where(AuditLog.tenant_id == staff.tenant_id)
+            rows = session.scalars(query.offset(offset).limit(limit + 1)).all()
+            has_more = len(rows) > limit
+            page = rows[:limit]
+            return {
+                "entries": [
+                    {
+                        "id": entry.id,
+                        "action": entry.action,
+                        "actor_user_id": entry.actor_user_id,
+                        "tenant_id": entry.tenant_id,
+                        "target_type": entry.target_type,
+                        "target_id": entry.target_id,
+                        "details": entry.details,
+                        "created_at": as_utc(entry.created_at).isoformat(),
+                    }
+                    for entry in page
+                ],
+                "has_more": has_more,
+            }
 
     @app.get("/api/admin/observability/runs")
     async def observability_runs(
@@ -1131,6 +1296,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # docs/design/09-Platform-Pivot-Decision.md).
             session.delete(user)
             session.commit()
+            record_audit_event(
+                session,
+                action="user_deleted",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="user",
+                target_id=user_id,
+            )
 
     @app.get("/api/admin/observability/costs")
     async def observability_costs(

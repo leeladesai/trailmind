@@ -69,6 +69,69 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class AdminSession(Base):
+    """P0-4: server-side record of every issued admin JWT, keyed by its `jti` claim
+    — what makes revocation possible at all for an otherwise-stateless JWT. A
+    token's signature/expiry alone (the old behavior) can't be invalidated before
+    it naturally expires; checking this table on every request (see
+    app/security.py::get_current_user) lets logout, a detected leak, or a future
+    "sign out everywhere" action actually take effect immediately."""
+
+    __tablename__ = "admin_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    jti: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TenantMembership(Base):
+    """P0-4 foundation: a user may belong to more than one tenant, each with its own
+    role — `User.tenant_id`/`User.role` stay as the primary/home tenant (every
+    existing platform-admin/business-admin behavior is unchanged and keeps reading
+    those columns directly), so this is additive, not a replacement. Deliberately
+    not yet wired into every authorization check in this pass — see AGENTS.md/README
+    enterprise-readiness notes: this is the extension point a real multi-tenant
+    membership UI (invite a user into a second tenant, switch active tenant, etc.)
+    would build on, kept minimal here rather than half-implemented everywhere."""
+
+    __tablename__ = "tenant_memberships"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    role: Mapped[str] = mapped_column(String(20), default="admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class AuditLog(Base):
+    """P0-4: append-only record of security-relevant admin actions — authentication,
+    tenant lifecycle changes, widget key issuance/rotation/revocation, catalog
+    changes, approvals, suspensions, and deletions (see
+    app/services/audit.py::record_audit_event, the only writer). `actor_user_id` is
+    nullable because a failed-login attempt has no authenticated user yet but is
+    still worth recording."""
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tenants.id"), nullable=True, index=True
+    )
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(60), index=True)
+    target_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    target_id: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+
+
 class CatalogItem(Base):
     """A tenant's catalog entry recommended by the widget. Originally AI-model-shaped
     (a fixed `modality` enum, `latency_ms`/`context_window`) from the hackathon's
