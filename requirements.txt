@@ -21,6 +21,7 @@ chromadb==0.4.24
 
 # Database
 sqlalchemy==2.0.23
+alembic==1.13.1
 # Postgres driver (Neon in prod — see render.yaml DATABASE_URL). psycopg2, not psycopg3,
 # so Neon's plain "postgresql://..." connection string works with SQLAlchemy's default
 # dialect as-is, no "+psycopg" URL rewriting needed. Binary wheel avoids needing
