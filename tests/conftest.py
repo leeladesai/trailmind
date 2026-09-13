@@ -1,4 +1,5 @@
 import os
+import socket
 from collections.abc import Iterator
 
 import pytest
@@ -46,6 +47,35 @@ def _isolate_langsmith_env() -> Iterator[None]:
         yield
     finally:
         _restore_pristine_langsmith_env()
+
+
+# P0-5: the standard suite must never need a live database, Mesh, LangSmith, SMTP,
+# Telegram, or any other external network call — TestClient's ASGI transport never
+# opens a real socket for the app itself, so any socket connect attempt seen during
+# the run can only come from a service-integration code path actually reaching out.
+# Blocking non-loopback connects for the whole session turns "the suite happens not
+# to need the network" into "the suite provably cannot use the network."
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+_real_socket_connect = socket.socket.connect
+
+
+def _guarded_connect(self: socket.socket, address):
+    host = address[0] if isinstance(address, tuple) else address
+    if host not in _LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"Blocked outbound network connection to {address!r} during tests — "
+            "the standard suite must be hermetic (see tests/test_hermetic.py)."
+        )
+    return _real_socket_connect(self, address)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _block_external_network() -> Iterator[None]:
+    socket.socket.connect = _guarded_connect
+    try:
+        yield
+    finally:
+        socket.socket.connect = _real_socket_connect
 
 
 @pytest.fixture()
