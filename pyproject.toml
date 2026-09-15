@@ -19,6 +19,11 @@ dependencies = [
     "chromadb==0.4.24",
     "sqlalchemy==2.0.23",
     "alembic==1.13.1",
+    # Postgres driver (Neon in prod — see render.yaml DATABASE_URL). psycopg2, not psycopg3,
+    # so Neon's plain "postgresql://..." connection string works with SQLAlchemy's default
+    # dialect as-is. Binary wheel avoids needing build tooling. Kept in sync with
+    # requirements.txt, which production installs from directly.
+    "psycopg2-binary==2.9.9",
     "python-jose[cryptography]==3.3.0",
     "passlib[bcrypt]==1.7.4",
     "bcrypt==4.0.1",
