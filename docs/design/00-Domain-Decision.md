@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Decision | Product/catalog domain for the SmartReco Build Challenge 2026 submission |
+| Decision | Product/catalog domain for the TrailMind Build Challenge 2026 submission |
 | Status | Finalized |
 | Supersedes | "Learning platform (courses/bootcamps)" domain used in the original planning pass |
 
