@@ -156,8 +156,8 @@ the platform generalized beyond one AI-model-catalog tenant.
 Backend:
 
 ```bash
-git clone https://github.com/leeladesai/smartreco-hackathon.git
-cd smartreco-hackathon
+git clone https://github.com/leeladesai/trailmind.git
+cd trailmind
 uv sync
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 cp .env.example .env           # fill in MESH_API_KEY=rsk_...
@@ -275,7 +275,7 @@ minimum `MESH_API_KEY`) and deploy. The frontend deploys separately (e.g. Vercel
 ## Project structure
 
 ```
-smartreco-hackathon/
+trailmind/
 ├── docs/design/            # design/planning docs — domain decision, requirements, HLD/LLD,
 │                            # platform pivot decision, widget architecture, test strategy
 ├── app/
