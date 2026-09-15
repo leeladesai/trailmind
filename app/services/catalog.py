@@ -102,10 +102,19 @@ def _sync_item(
     try:
         vector_store.upsert(item, widget_id)
         item.vector_synced = True
+        item.vector_index_status = "synced"
+        item.vector_index_error = None
+        item.vector_indexed_at = datetime.utcnow()
+        item.vector_index_attempts = 0
         session.commit()
-    except Exception:
+    except Exception as exc:
         session.rollback()
         persisted_item = session.get(CatalogItem, item.id)
         if persisted_item:
             persisted_item.vector_synced = False
+            persisted_item.vector_index_status = "failed"
+            persisted_item.vector_index_error = str(exc)[:500]
+            persisted_item.vector_index_attempts = (
+                persisted_item.vector_index_attempts or 0
+            ) + 1
             session.commit()

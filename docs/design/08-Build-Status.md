@@ -121,11 +121,12 @@ commit as the code — don't let this drift into a second, stale plan.
 >
 > Product rebrand (this session): SmartReco → TrailMind everywhere the string referred to our
 > app (page titles, nav, cookie name, LangSmith project, digest copy, localStorage keys, demo
-> account domain, `pyproject.toml`, every doc header) — deliberately excluding "SmartReco
-> Build Challenge 2026" (the hackathon program's own name, not ours) and the GitHub
-> repo/directory name and `.github/workflows/*.yml` (tied to the hackathon's OIDC/grading
-> identifiers). Verified live: `/health` returns `service: "trailmind"`, session cookie is
-> `trailmind_session`.
+> account domain, `pyproject.toml`, every doc header). Verified live: `/health` returns
+> `service: "trailmind"`, session cookie is `trailmind_session`.
+>
+> Follow-up rebrand (later session): remaining "SmartReco Build Challenge 2026" hackathon-program
+> references across the docs, the GitHub repo/directory name, and the dev script were also
+> updated to TrailMind, at the user's explicit request, superseding the exclusion noted above.
 >
 > Context-scoped feedback loop (this session): `recent_feedback_by_model` now also resolves
 > the `behavior_summary` of the recommendation each rating was tied to (via the

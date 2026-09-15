@@ -69,6 +69,69 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class AdminSession(Base):
+    """P0-4: server-side record of every issued admin JWT, keyed by its `jti` claim
+    — what makes revocation possible at all for an otherwise-stateless JWT. A
+    token's signature/expiry alone (the old behavior) can't be invalidated before
+    it naturally expires; checking this table on every request (see
+    app/security.py::get_current_user) lets logout, a detected leak, or a future
+    "sign out everywhere" action actually take effect immediately."""
+
+    __tablename__ = "admin_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    jti: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TenantMembership(Base):
+    """P0-4 foundation: a user may belong to more than one tenant, each with its own
+    role — `User.tenant_id`/`User.role` stay as the primary/home tenant (every
+    existing platform-admin/business-admin behavior is unchanged and keeps reading
+    those columns directly), so this is additive, not a replacement. Deliberately
+    not yet wired into every authorization check in this pass — see AGENTS.md/README
+    enterprise-readiness notes: this is the extension point a real multi-tenant
+    membership UI (invite a user into a second tenant, switch active tenant, etc.)
+    would build on, kept minimal here rather than half-implemented everywhere."""
+
+    __tablename__ = "tenant_memberships"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    role: Mapped[str] = mapped_column(String(20), default="admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class AuditLog(Base):
+    """P0-4: append-only record of security-relevant admin actions — authentication,
+    tenant lifecycle changes, widget key issuance/rotation/revocation, catalog
+    changes, approvals, suspensions, and deletions (see
+    app/services/audit.py::record_audit_event, the only writer). `actor_user_id` is
+    nullable because a failed-login attempt has no authenticated user yet but is
+    still worth recording."""
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tenants.id"), nullable=True, index=True
+    )
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(60), index=True)
+    target_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    target_id: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+
+
 class CatalogItem(Base):
     """A tenant's catalog entry recommended by the widget. Originally AI-model-shaped
     (a fixed `modality` enum, `latency_ms`/`context_window`) from the hackathon's
@@ -103,7 +166,17 @@ class CatalogItem(Base):
     specs: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     use_case_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # `vector_synced` stays as a simple boolean mirror of
+    # `vector_index_status == "synced"` for every pre-existing reader (e.g.
+    # onboarding_status's catalog_ready check) — the richer state below is what the
+    # reconciliation service (app/services/catalog_reconciliation.py) actually
+    # reasons about, since a bare boolean can't distinguish "never synced yet" from
+    # "synced, then Chroma's ephemeral disk wiped it" from "actively failing."
     vector_synced: Mapped[bool] = mapped_column(Boolean, default=False)
+    vector_index_status: Mapped[str] = mapped_column(String(20), default="pending")
+    vector_index_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vector_indexed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    vector_index_attempts: Mapped[int] = mapped_column(Integer, default=0)
     # Catalog ingestion adapters (M4, docs/design plan): who/what produced this row.
     # "manual" (CAT-1..5, default — unaffected by this phase) never needs review; a
     # "feed"-sourced row is auto-approved like manual entries, while a "scrape"-sourced
@@ -175,6 +248,14 @@ class Recommendation(Base):
     mesh_prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mesh_completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mesh_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # P1-4 auditability: exact model + wire messages/response for this generation,
+    # captured directly from the Mesh call (app/services/mesh.py) — LangSmith tracing
+    # is opt-in and off by default, so this is the only durable record of what was
+    # actually sent/returned unless tracing happens to be on. Null under the same
+    # conditions mesh_latency_ms is null (no Mesh configured, retrieval-only).
+    mesh_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    mesh_raw_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mesh_raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     # DLV-2: set when this recommendation was actually pushed to an open
     # `/api/widget/stream` connection at generation time — null means either no
     # connection was open (the visitor picks it up via GET /api/recommendations/latest

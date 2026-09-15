@@ -136,6 +136,16 @@ class CatalogItemVectorStore:
     def delete(self, catalog_item_id: int, widget_id: int) -> None:
         self._collection_for(widget_id).delete(ids=[str(catalog_item_id)])
 
+    def contains(self, catalog_item_id: int, widget_id: int) -> bool:
+        """Whether this item's vector entry actually exists in Chroma right now —
+        the reconciliation service's ground truth check. A row can have
+        `vector_index_status == "synced"` from a previous successful upsert while
+        Chroma's own on-disk data has since vanished (ephemeral disk on Render's
+        free tier — see README); this is what catches that drift instead of
+        trusting the stale flag."""
+        result = self._collection_for(widget_id).get(ids=[str(catalog_item_id)])
+        return len(result.get("ids", [])) > 0
+
     def query_scored(
         self, text: str, widget_id: int, limit: int = 5, where: dict | None = None
     ) -> list[tuple[int, float]]:

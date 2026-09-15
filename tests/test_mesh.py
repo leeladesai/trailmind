@@ -116,6 +116,26 @@ def test_generate_captures_latency_and_tokens() -> None:
     assert result.completion_tokens == 50
 
 
+def test_generate_captures_model_and_raw_prompt_response() -> None:
+    """P1-4 auditability: the exact model + wire messages/response must be captured
+    so a Recommendation row is self-explanatory without depending on LangSmith
+    tracing, which is opt-in and off by default."""
+    content = json.dumps(
+        {"activity_understanding": "ok", "recommendation_points": ["ok"]}
+    )
+    generator = _generator_with_response(content)
+    generator.model = "gpt-4o-mini"
+    result = generator.generate(
+        "summary", [{"id": 4, "title": "Cartesia Sonic", "provider": "Cartesia"}]
+    )
+    assert result.model == "gpt-4o-mini"
+    assert result.raw_response == content
+    prompt_messages = json.loads(result.raw_prompt)
+    assert prompt_messages[0]["role"] == "system"
+    assert prompt_messages[1]["role"] == "user"
+    assert "Cartesia Sonic" in prompt_messages[1]["content"]
+
+
 def test_generate_cost_is_none_when_pricing_lookup_fails() -> None:
     """Cost is best-effort — a failed/unavailable pricing lookup must never break
     latency/token capture, the more load-bearing efficiency signals."""

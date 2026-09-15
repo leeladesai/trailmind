@@ -9,6 +9,7 @@ Widget's docstring in app/models.py).
 """
 
 import httpx
+import pytest
 
 import app.services.ingestion as ingestion_module
 from app.models import CatalogItem, Widget
@@ -18,6 +19,7 @@ from app.services.ingestion import (
     scrape_confirm,
     scrape_preview,
     sync_feed,
+    sync_feed_with_retry,
 )
 from app.services.widgets import configure_feed, create_widget
 
@@ -27,6 +29,8 @@ class _FakeResponse:
         self.content = content
         self.text = text
         self.status_code = status_code
+        self.is_redirect = False
+        self.headers: dict = {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -63,7 +67,7 @@ def _login(client) -> None:
 def test_feed_sync_imports_rows_tagged_and_stamped(
     client, reference_widget, monkeypatch
 ) -> None:
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **_kwargs):
         return _FakeResponse(content=FEED_JSON)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -87,7 +91,7 @@ def test_feed_sync_imports_rows_tagged_and_stamped(
 def test_feed_sync_marks_existing_rows_stale_on_failure(
     client, reference_widget, monkeypatch
 ) -> None:
-    def fake_get_ok(url, headers=None, timeout=None):
+    def fake_get_ok(url, headers=None, timeout=None, **_kwargs):
         return _FakeResponse(content=FEED_JSON)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_ok)
@@ -98,7 +102,7 @@ def test_feed_sync_marks_existing_rows_stale_on_failure(
         configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
         sync_feed(session, client.app.state.vector_store, widget_row)
 
-    def fake_get_fail(url, headers=None, timeout=None):
+    def fake_get_fail(url, headers=None, timeout=None, **_kwargs):
         raise httpx.ConnectError("network down")
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_fail)
@@ -115,8 +119,54 @@ def test_feed_sync_marks_existing_rows_stale_on_failure(
         assert item.sync_stale is True
 
 
+def test_sync_feed_with_retry_succeeds_after_transient_failures(
+    client, reference_widget, monkeypatch
+) -> None:
+    """P1-5: the scheduled sweep (unlike the manual sync endpoint) is worth
+    retrying a couple of times before giving up on a transient fetch failure."""
+    widget, _ = reference_widget
+    monkeypatch.setattr(ingestion_module.time, "sleep", lambda _seconds: None)
+    attempts = {"count": 0}
+
+    def flaky_get(url, headers=None, timeout=None, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise httpx.ConnectError("network down")
+        return _FakeResponse(content=FEED_JSON)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", flaky_get)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        rows = sync_feed_with_retry(session, client.app.state.vector_store, widget_row)
+        assert rows[0]["status"] == "inserted"
+    assert attempts["count"] == 3
+
+
+def test_sync_feed_with_retry_gives_up_after_max_attempts(
+    client, reference_widget, monkeypatch
+) -> None:
+    widget, _ = reference_widget
+    monkeypatch.setattr(ingestion_module.time, "sleep", lambda _seconds: None)
+    attempts = {"count": 0}
+
+    def always_fails(url, headers=None, timeout=None, **_kwargs):
+        attempts["count"] += 1
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", always_fails)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        with pytest.raises(FeedSyncError):
+            sync_feed_with_retry(
+                session, client.app.state.vector_store, widget_row, max_attempts=3
+            )
+    assert attempts["count"] == 3
+
+
 def test_scrape_preview_extracts_json_ld_product(client, monkeypatch) -> None:
-    def fake_get(url, timeout=None, follow_redirects=True):
+    def fake_get(url, timeout=None, follow_redirects=True, **_kwargs):
         return _FakeResponse(text=PRODUCT_PAGE_HTML)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -128,7 +178,7 @@ def test_scrape_preview_extracts_json_ld_product(client, monkeypatch) -> None:
 
 
 def test_scrape_preview_raises_when_no_markup_found(client, monkeypatch) -> None:
-    def fake_get(url, timeout=None, follow_redirects=True):
+    def fake_get(url, timeout=None, follow_redirects=True, **_kwargs):
         return _FakeResponse(text="<html><body>Nothing here.</body></html>")
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -214,7 +264,7 @@ def test_ingestion_status_reflects_feed_and_scrape_state(
     _login(client)
     widget, _ = reference_widget
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **_kwargs):
         return _FakeResponse(content=FEED_JSON)
 
     monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
@@ -309,3 +359,137 @@ def test_ingestion_status_isolated_per_widget(client, reference_widget) -> None:
     assert login.status_code == 200
     status = client.get(f"/api/admin/widgets/{other_widget_id}/ingestion/status")
     assert status.json()["scrape"]["pending_review"] == 0
+
+
+# P0-6 (SSRF guard): feed sync and scrape preview must refuse to fetch
+# internal/private targets even though an admin fully controls both inputs — an
+# admin account on one tenant is not a trusted operator of the shared server's
+# network, and a compromised admin session shouldn't become an SSRF pivot.
+
+
+def test_feed_sync_rejects_internal_url_without_ever_calling_httpx(
+    client, reference_widget, monkeypatch
+) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("httpx.get must not be called for an unsafe URL")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fail_if_called)
+    widget, _ = reference_widget
+
+    with client.app.state.session_factory() as session:
+        widget = session.get(Widget, widget.id)
+        configure_feed(session, widget, "http://169.254.169.254/latest/meta-data/")
+        with pytest.raises(FeedSyncError):
+            sync_feed(session, client.app.state.vector_store, widget)
+
+
+def test_scrape_preview_rejects_internal_url_without_ever_calling_httpx(
+    monkeypatch,
+) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("httpx.get must not be called for an unsafe URL")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fail_if_called)
+
+    with pytest.raises(ScrapeError):
+        scrape_preview("http://127.0.0.1:8000/admin")
+
+
+FEED_JSON_TWO_ITEMS = b"""
+{"models": [
+    {"title": "Feed Item One", "provider": "Feed Co", "category": "LLM",
+     "price": "$1", "description": "From the feed."},
+    {"title": "Feed Item Two", "provider": "Feed Co", "category": "LLM",
+     "price": "$2", "description": "Also from the feed."}
+]}
+"""
+
+
+def test_feed_sync_delists_item_no_longer_present_upstream(
+    client, reference_widget, monkeypatch
+) -> None:
+    widget, _ = reference_widget
+
+    def fake_get_two(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON_TWO_ITEMS)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_two)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        sync_feed(session, client.app.state.vector_store, widget_row)
+
+        item_two = session.query(CatalogItem).filter_by(title="Feed Item Two").one()
+        assert item_two.vector_synced is True
+
+    def fake_get_one(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_one)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        sync_feed(session, client.app.state.vector_store, widget_row)
+
+        item_one = session.query(CatalogItem).filter_by(title="Feed Item One").one()
+        assert item_one.review_status == "approved"
+
+        item_two = session.query(CatalogItem).filter_by(title="Feed Item Two").one()
+        assert item_two.review_status == "delisted"
+        assert item_two.vector_synced is False
+        assert not client.app.state.vector_store.contains(item_two.id, widget.id)
+
+
+def test_feed_sync_reactivates_delisted_item_that_reappears(
+    client, reference_widget, monkeypatch
+) -> None:
+    widget, _ = reference_widget
+
+    def fake_get_two(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON_TWO_ITEMS)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_two)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        configure_feed(session, widget_row, "https://vendor.example.com/feed.json")
+        sync_feed(session, client.app.state.vector_store, widget_row)
+
+    def fake_get_one(url, headers=None, timeout=None, **_kwargs):
+        return _FakeResponse(content=FEED_JSON)
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_one)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        sync_feed(session, client.app.state.vector_store, widget_row)
+        item_two_id = (
+            session.query(CatalogItem).filter_by(title="Feed Item Two").one().id
+        )
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get_two)
+    with client.app.state.session_factory() as session:
+        widget_row = session.get(Widget, widget.id)
+        rows = sync_feed(session, client.app.state.vector_store, widget_row)
+        reactivated = [row for row in rows if row["title"] == "Feed Item Two"][0]
+        assert reactivated["status"] == "reactivated"
+
+        item_two = session.get(CatalogItem, item_two_id)
+        assert item_two.review_status == "approved"
+        assert item_two.vector_synced is True
+        assert client.app.state.vector_store.contains(item_two.id, widget.id)
+
+
+def test_scrape_preview_revalidates_each_redirect_hop(monkeypatch) -> None:
+    """A URL that resolves safely can still redirect to an internal address —
+    following it with no re-check would defeat the guard entirely."""
+
+    def fake_get(url, timeout=None, follow_redirects=False, **_kwargs):
+        if url == "https://shop.example.com/widget":
+            response = _FakeResponse(status_code=302)
+            response.is_redirect = True
+            response.headers = {"location": "http://169.254.169.254/secret"}
+            return response
+        raise AssertionError(f"unexpected fetch of {url!r}")
+
+    monkeypatch.setattr(ingestion_module.httpx, "get", fake_get)
+
+    with pytest.raises(ScrapeError):
+        scrape_preview("https://shop.example.com/widget")

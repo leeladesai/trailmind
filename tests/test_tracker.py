@@ -141,6 +141,8 @@ def test_track_events_drops_a_foreign_widgets_catalog_item_id(
         tenant_b = create_tenant(session, "Tenant B")
         widget_a, key_a = create_widget(session, tenant_a, "Widget A")
         widget_b, _ = create_widget(session, tenant_b, "Widget B")
+        # /api/recommendations/latest (checked below) requires an active widget.
+        widget_a.status = "active"
         widget_a_id = widget_a.id
         foreign_item = CatalogItem(
             tenant_id=tenant_b.id,
@@ -276,7 +278,9 @@ def test_recommendations_latest_is_pending_with_no_activity(
 ) -> None:
     with client.app.state.session_factory() as session:
         tenant = create_tenant(session, "Acme Bank")
-        _, raw_key = create_widget(session, tenant, "Credit Cards")
+        widget, raw_key = create_widget(session, tenant, "Credit Cards")
+        widget.status = "active"
+        session.commit()
 
     response = client.get(
         f"/api/recommendations/latest?widget_key={raw_key}&visitor_id=v-none"

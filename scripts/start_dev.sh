@@ -26,8 +26,8 @@ HOST="${HOST:-127.0.0.1}"
 # (banking_agent) — this default only matters the first time; PORT= still overrides.
 PORT="${PORT:-8011}"
 LOG_DIR="${ROOT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/smartreco-dev.log"
-PID_FILE="${LOG_DIR}/smartreco-dev.pid"
+LOG_FILE="${LOG_DIR}/trailmind-dev.log"
+PID_FILE="${LOG_DIR}/trailmind-dev.pid"
 
 mkdir -p "${LOG_DIR}"
 cd "${ROOT_DIR}"
@@ -55,16 +55,16 @@ tail_logs() {
 do_status() {
   local pid
   if pid="$(running_pid)"; then
-    echo "SmartReco is running (PID ${pid}) on http://${HOST}:${PORT}"
+    echo "TrailMind is running (PID ${pid}) on http://${HOST}:${PORT}"
   else
-    echo "SmartReco is not running."
+    echo "TrailMind is not running."
   fi
 }
 
 do_stop() {
   local pid
   if pid="$(running_pid)"; then
-    echo "Stopping SmartReco (PID ${pid})..."
+    echo "Stopping TrailMind (PID ${pid})..."
     kill "${pid}" 2>/dev/null || true
     for _ in {1..10}; do
       kill -0 "${pid}" 2>/dev/null || break
@@ -74,18 +74,18 @@ do_stop() {
     rm -f "${PID_FILE}"
     echo "Stopped."
   else
-    echo "SmartReco is not running."
+    echo "TrailMind is not running."
   fi
 }
 
 do_start() {
   local pid
   if pid="$(running_pid)"; then
-    echo "SmartReco backend is already running (PID ${pid}) on http://${HOST}:${PORT}"
+    echo "TrailMind backend is already running (PID ${pid}) on http://${HOST}:${PORT}"
     tail_logs
   fi
 
-  echo "Starting SmartReco backend on http://${HOST}:${PORT}"
+  echo "Starting TrailMind backend on http://${HOST}:${PORT}"
   echo "API docs: http://${HOST}:${PORT}/docs"
   echo "Health:   http://${HOST}:${PORT}/health"
   echo "Log:      ${LOG_FILE}"
@@ -110,11 +110,11 @@ do_start() {
 
   for _ in {1..15}; do
     if grep -q "Application startup complete" "${LOG_FILE}" 2>/dev/null; then
-      echo "SmartReco started."
+      echo "TrailMind started."
       tail_logs
     fi
     if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
-      echo "SmartReco failed to start. Recent logs:"
+      echo "TrailMind failed to start. Recent logs:"
       tail -n 40 "${LOG_FILE}"
       rm -f "${PID_FILE}"
       exit 1
@@ -122,7 +122,7 @@ do_start() {
     sleep 1
   done
 
-  echo "SmartReco did not report startup within 15 seconds. Tailing logs..."
+  echo "TrailMind did not report startup within 15 seconds. Tailing logs..."
   tail_logs
 }
 

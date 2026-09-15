@@ -11,6 +11,7 @@ from app.services.agent_graph import (
     prepare_retrieval_recommendation,
     rerank_by_lexical_overlap,
 )
+from app.services.mesh import NarrativeResult
 from app.services.recommendation import FeedbackRecord
 from app.services.widgets import create_widget
 
@@ -520,6 +521,63 @@ def test_feedback_carries_over_to_a_similar_query() -> None:
     feedback = {1: FeedbackRecord(rating="down", context_query="voice assistant item")}
     reranked = apply_feedback_adjustment(scored, feedback, "looking for a voice item")
     assert reranked == [(1, 0.5 + 1.0)]
+
+
+def test_generated_recommendation_persists_mesh_audit_fields(tmp_path) -> None:
+    """P1-4: model + raw prompt/response must land on the stored Recommendation row,
+    not just the retrieval-only fields — this is the durable audit trail when
+    LangSmith tracing (opt-in, off by default) isn't turned on."""
+    session_factory = _make_session_factory(tmp_path)
+    with session_factory() as session:
+        tenant = _make_tenant(session)
+        widget = _make_widget(session, tenant)
+        visitor_id = "v-audit"
+        item = CatalogItem(
+            tenant_id=tenant.id,
+            widget_id=widget.id,
+            title="Travel Card",
+            provider="Acme",
+            category="LLM",
+            price="$0",
+            description="d",
+            use_case_tags=[],
+        )
+        session.add(item)
+        session.commit()
+        session.add(
+            Event(
+                tenant_id=tenant.id,
+                widget_id=widget.id,
+                visitor_id=visitor_id,
+                event_type="search",
+                metadata_json={"query": "test"},
+            )
+        )
+        session.commit()
+
+        class NarrativeMeshGenerator:
+            enabled = True
+
+            def generate(self, behavior_summary, candidates):
+                return NarrativeResult(
+                    narrative="ok",
+                    catalog_item_ids=[item.id],
+                    model="gpt-4o-mini",
+                    raw_prompt='[{"role": "system", "content": "..."}]',
+                    raw_response='{"activity_understanding": "ok"}',
+                )
+
+        store = FakeVectorStore(item.id, item.id)
+        recommendation = prepare_retrieval_recommendation(
+            session, store, widget.id, tenant.id, visitor_id, NarrativeMeshGenerator()
+        )
+
+        assert recommendation is not None
+        assert recommendation.mesh_model == "gpt-4o-mini"
+        assert (
+            recommendation.mesh_raw_prompt == '[{"role": "system", "content": "..."}]'
+        )
+        assert recommendation.mesh_raw_response == '{"activity_understanding": "ok"}'
 
 
 def test_agent_pipeline_trace_never_receives_secrets_as_traced_inputs(

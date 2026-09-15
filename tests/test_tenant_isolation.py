@@ -138,6 +138,11 @@ def test_widget_key_never_surfaces_another_widgets_recommendation(
         session.commit()
         widget_a, key_a = create_widget(session, tenant_a, "Widget A")
         widget_b, key_b = create_widget(session, tenant_b, "Widget B")
+        # /api/recommendations/latest requires an active widget (same policy as
+        # every other widget-facing endpoint) — this test is about cross-widget
+        # isolation, not onboarding-gating, so activate both up front.
+        widget_a.status = "active"
+        widget_b.status = "active"
         item_b = CatalogItem(
             tenant_id=tenant_b.id,
             widget_id=widget_b.id,

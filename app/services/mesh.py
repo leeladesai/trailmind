@@ -43,6 +43,13 @@ class NarrativeResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     cost_usd: float | None = None
+    # P1-4 auditability: the exact model + wire messages/response for this
+    # generation, persisted onto the Recommendation row so "why did the model say
+    # this" is answerable straight from our own DB — LangSmith tracing is opt-in and
+    # off by default, so it can't be relied on as the only record.
+    model: str | None = None
+    raw_prompt: str | None = None
+    raw_response: str | None = None
 
 
 # Deterministic safety net, not just a prompt request: catalog primary keys are an
@@ -160,18 +167,19 @@ class MeshNarrativeGenerator:
             raise RuntimeError("Mesh narrative generation is not configured")
 
         candidate_text = self._candidate_text(candidates)
+        messages = [
+            {"role": "system", "content": NARRATIVE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_narrative_user_message(
+                    behavior_summary, candidate_text
+                ),
+            },
+        ]
         started_at = time.monotonic()
         response = self.client.chat.completions.create(
             model=self.model,
-            messages=[
-                {"role": "system", "content": NARRATIVE_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": build_narrative_user_message(
-                        behavior_summary, candidate_text
-                    ),
-                },
-            ],
+            messages=messages,
         )
         latency_ms = (time.monotonic() - started_at) * 1000
         usage = getattr(response, "usage", None)
@@ -208,6 +216,9 @@ class MeshNarrativeGenerator:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost_usd=cost_usd,
+            model=self.model,
+            raw_prompt=json.dumps(messages),
+            raw_response=content,
         )
 
     @traceable(run_type="llm", name="mesh_answer_question")

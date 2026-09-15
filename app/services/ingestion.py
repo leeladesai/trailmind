@@ -11,6 +11,7 @@ the same tenant can sync from two different feeds.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -28,14 +29,45 @@ from app.services.catalog_import import (
     import_catalog_rows,
     parse_catalog_file,
 )
+from app.services.url_safety import UnsafeURLError, assert_url_is_safe
 from app.vector import CatalogItemVectorStore
 
 FETCH_TIMEOUT_SECONDS = 10.0
+MAX_REDIRECTS = 5
+
+
+def _safe_get(
+    url: str,
+    *,
+    headers: dict | None = None,
+    timeout: float = FETCH_TIMEOUT_SECONDS,
+    follow_redirects: bool = False,
+) -> httpx.Response:
+    """SSRF-guarded httpx.get: re-validates the target before every fetch,
+    including each redirect hop — a URL that resolves safely can still redirect
+    to an internal address, and blindly following it would fetch that hop with
+    no check at all."""
+    current_url = url
+    for _ in range(MAX_REDIRECTS + 1):
+        assert_url_is_safe(current_url)
+        response = httpx.get(
+            current_url, headers=headers or {}, timeout=timeout, follow_redirects=False
+        )
+        if follow_redirects and getattr(response, "is_redirect", False):
+            location = response.headers.get("location")
+            if not location:
+                return response
+            current_url = str(httpx.URL(current_url).join(location))
+            continue
+        return response
+    raise UnsafeURLError(f"Too many redirects while fetching {url!r}.")
 
 
 class FeedSyncError(ValueError):
     """The feed URL couldn't be fetched or parsed. Existing feed-sourced rows are
-    flagged `sync_stale` rather than removed (ING-5: serve last-known-good)."""
+    flagged `sync_stale` rather than removed (ING-5: serve last-known-good) —
+    a row is only ever delisted by a *successful* sync that confirms it's gone
+    (see _reconcile_removed_feed_rows), never by a failure."""
 
 
 class ScrapeError(ValueError):
@@ -54,6 +86,48 @@ def _set_feed_rows_stale(session: Session, widget_id: int, stale: bool) -> None:
     session.commit()
 
 
+def _reconcile_removed_feed_rows(
+    session: Session,
+    vector_store: CatalogItemVectorStore,
+    widget: Widget,
+    raw_rows: list[dict],
+) -> int:
+    """A successful sync confirms the full current state of the upstream feed, so
+    any previously-synced feed row whose title is no longer present has actually
+    been removed upstream — not just a transient fetch failure (that case is
+    `sync_stale`, set on error, never here). Such a row is "delisted" (removed from
+    the vector store, excluded from retrieval) rather than hard-deleted: an Event
+    or Recommendation may still reference its id for historical analytics, and
+    import_catalog_rows reactivates a delisted row if its title reappears in a
+    later sync instead of inserting a duplicate.
+    """
+    current_titles = set()
+    for raw in raw_rows:
+        title = _coerce_row(raw).get("title")
+        if title:
+            current_titles.add(str(title).strip().lower())
+
+    stale_rows = session.scalars(
+        select(CatalogItem).where(
+            CatalogItem.widget_id == widget.id,
+            CatalogItem.ingestion_adapter == "feed",
+            CatalogItem.review_status == "approved",
+        )
+    ).all()
+    delisted = 0
+    for row in stale_rows:
+        if row.title.strip().lower() in current_titles:
+            continue
+        vector_store.delete(row.id, widget.id)
+        row.review_status = "delisted"
+        row.vector_synced = False
+        row.vector_index_status = "pending"
+        delisted += 1
+    if delisted:
+        session.commit()
+    return delisted
+
+
 def sync_feed(
     session: Session, vector_store: CatalogItemVectorStore, widget: Widget
 ) -> list[dict]:
@@ -63,6 +137,8 @@ def sync_feed(
     stamped now. On any fetch/parse failure, existing feed-sourced rows for this
     widget are marked `sync_stale=True` (and left in place, still serving) rather than
     raising past the caller silently — callers surface `FeedSyncError` to the admin.
+    On success, any previously-synced feed row no longer present in the fresh feed
+    is delisted (see _reconcile_removed_feed_rows) rather than left live indefinitely.
     """
     if not widget.feed_url:
         raise FeedSyncError("No feed URL configured for this widget.")
@@ -73,11 +149,14 @@ def sync_feed(
         else {}
     )
     try:
-        response = httpx.get(
+        response = _safe_get(
             widget.feed_url, headers=headers, timeout=FETCH_TIMEOUT_SECONDS
         )
         response.raise_for_status()
         raw_rows = parse_catalog_file("feed.json", response.content)
+    except UnsafeURLError as exc:
+        _set_feed_rows_stale(session, widget.id, True)
+        raise FeedSyncError(str(exc)) from exc
     except httpx.HTTPError as exc:
         _set_feed_rows_stale(session, widget.id, True)
         raise FeedSyncError(f"Could not fetch feed: {exc}") from exc
@@ -93,8 +172,39 @@ def sync_feed(
         ingestion_adapter="feed",
         last_synced_at=datetime.now(timezone.utc),
     )
+    _reconcile_removed_feed_rows(session, vector_store, widget, raw_rows)
     _set_feed_rows_stale(session, widget.id, False)
     return results
+
+
+def sync_feed_with_retry(
+    session: Session,
+    vector_store: CatalogItemVectorStore,
+    widget: Widget,
+    *,
+    max_attempts: int = 3,
+    backoff_seconds: float = 2.0,
+) -> list[dict]:
+    """P1-5: bounded retry with exponential backoff around `sync_feed`, for the
+    unattended scheduled sweep only — a manual admin-triggered sync
+    (POST .../feed/sync) deliberately calls `sync_feed` directly and fails fast, since
+    there's a real request (and a real admin) waiting on the response; the scheduled
+    sweep has no one waiting, so it's worth absorbing a transient fetch hiccup (a
+    momentary DNS blip, a 5xx) before falling back to `sync_stale=True` for real.
+    Retrying an unsafe-URL or unparseable-feed failure is pointless (the same input
+    will fail identically every time), but harmless — it just burns a couple of wasted
+    attempts before giving up with the same error either way.
+    """
+    last_error: FeedSyncError | None = None
+    for attempt in range(max_attempts):
+        try:
+            return sync_feed(session, vector_store, widget)
+        except FeedSyncError as exc:
+            last_error = exc
+            if attempt < max_attempts - 1:
+                time.sleep(backoff_seconds * (2**attempt))
+    assert last_error is not None
+    raise last_error
 
 
 def _extract_json_ld_products(soup: BeautifulSoup) -> list[dict]:
@@ -167,8 +277,10 @@ def scrape_preview(url: str, selectors: dict[str, str] | None = None) -> dict:
     `{"rows": [...], "markup_type": "json-ld" | "css-selector"}`.
     """
     try:
-        response = httpx.get(url, timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True)
+        response = _safe_get(url, timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True)
         response.raise_for_status()
+    except UnsafeURLError as exc:
+        raise ScrapeError(str(exc)) from exc
     except httpx.HTTPError as exc:
         raise ScrapeError(f"Could not fetch page: {exc}") from exc
 

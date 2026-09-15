@@ -1,4 +1,6 @@
+import ipaddress
 import os
+import socket
 from collections.abc import Iterator
 
 import pytest
@@ -46,6 +48,56 @@ def _isolate_langsmith_env() -> Iterator[None]:
         yield
     finally:
         _restore_pristine_langsmith_env()
+
+
+# P0-5: the standard suite must never need a live database, Mesh, LangSmith, SMTP,
+# Telegram, or any other external network call — TestClient's ASGI transport never
+# opens a real socket for the app itself, so any socket connect attempt seen during
+# the run can only come from a service-integration code path actually reaching out.
+# Blocking non-loopback connects for the whole session turns "the suite happens not
+# to need the network" into "the suite provably cannot use the network."
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+_real_socket_connect = socket.socket.connect
+
+
+def _guarded_connect(self: socket.socket, address):
+    host = address[0] if isinstance(address, tuple) else address
+    if host not in _LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"Blocked outbound network connection to {address!r} during tests — "
+            "the standard suite must be hermetic (see tests/test_hermetic.py)."
+        )
+    return _real_socket_connect(self, address)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _block_external_network() -> Iterator[None]:
+    socket.socket.connect = _guarded_connect
+    try:
+        yield
+    finally:
+        socket.socket.connect = _real_socket_connect
+
+
+# P0-6 (SSRF guard, app/services/url_safety.py): resolving a hostname is itself a
+# real network operation and isn't a socket.socket.connect call, so it slips past
+# the guard above — left unstubbed, every ingestion test naming a domain like
+# "vendor.example.com" would perform a real DNS lookup. Default every test to a
+# deterministic public address; a test exercising the guard's rejection path
+# overrides this via its own monkeypatch fixture parameter.
+def _fake_public_getaddrinfo(host, *_args, **_kwargs):
+    # A literal IP address resolves to itself (real getaddrinfo does the same) —
+    # this must not mask the url_safety tests that pass an internal IP directly.
+    try:
+        ipaddress.ip_address(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, 0))]
+    except ValueError:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+
+@pytest.fixture(autouse=True)
+def _stub_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_public_getaddrinfo)
 
 
 @pytest.fixture()

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models import CatalogItem, Widget
 from app.schemas import CatalogItemCreate
-from app.services.catalog import create_catalog_item
+from app.services.catalog import create_catalog_item, update_catalog_item
 from app.vector import CatalogItemVectorStore
 
 
@@ -196,6 +196,24 @@ def import_catalog_rows(
             )
         ).first()
         if existing:
+            # A previously feed-sourced row that disappeared from an earlier sync
+            # (see ingestion.py's feed reconciliation) is "delisted" rather than
+            # deleted — if the same title reappears in a later sync, reactivate the
+            # existing row (and its history) instead of treating it as a duplicate.
+            if existing.review_status == "delisted":
+                existing.ingestion_adapter = ingestion_adapter
+                existing.last_synced_at = last_synced_at
+                existing.review_status = "approved"
+                update_catalog_item(session, vector_store, widget.id, existing, payload)
+                results.append(
+                    {
+                        "row": index,
+                        "title": payload.title,
+                        "status": "reactivated",
+                        "errors": [],
+                    }
+                )
+                continue
             results.append(
                 {
                     "row": index,

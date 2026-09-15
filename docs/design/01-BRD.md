@@ -3,7 +3,7 @@
 
 | | |
 |---|---|
-| Project | TrailMind (originated at the SmartReco Build Challenge 2026 hackathon — see §1a) |
+| Project | TrailMind (originated at the TrailMind Build Challenge 2026 hackathon — see §1a) |
 | Document owner | [Your name / team] |
 | Version | 2.0 — updated for the platform pivot |
 | Status | §1–§9 below describe the post-pivot business shape; historical hackathon-only context (rubric, judges, CI screener) is retained in §1a since it explains *why* the architecture exists, not because it's still the active goal |
@@ -22,7 +22,7 @@ kept as historical record of the hackathon origin.
 
 ## 1. Background
 
-SmartReco Build Challenge 2026 asks teams to build a catalog/marketplace platform where an
+TrailMind Build Challenge 2026 asks teams to build a catalog/marketplace platform where an
 agentic AI system observes user behavior, retrieves relevant catalog items via RAG, and produces
 persuasive, personalized recommendations that refresh as behavior evolves. Submissions are
 screened by an automated system, then judged by humans. Faked features (hardcoded recs, unused
@@ -38,7 +38,7 @@ domain used in the first planning pass.
 
 ## 1a. Historical: hackathon origin (kept for context, not the active goal)
 
-SmartReco Build Challenge 2026 asked teams to build a catalog/marketplace platform where an
+TrailMind Build Challenge 2026 asked teams to build a catalog/marketplace platform where an
 agentic AI system observes user behavior, retrieves relevant catalog items via RAG, and produces
 persuasive, personalized recommendations that refresh as behavior evolves, screened by an
 automated system then judged by humans. That constraint shaped the original architecture (two

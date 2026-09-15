@@ -51,7 +51,7 @@ def _make_non_admin(client: TestClient, email: str) -> None:
         session.add(user)
         session.commit()
         session.refresh(user)
-        token = create_session_token(user, client.app.state.settings)
+        token = create_session_token(session, user, client.app.state.settings)
     client.cookies.set(client.app.state.settings.session_cookie_name, token)
 
 

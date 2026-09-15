@@ -2,10 +2,13 @@ import asyncio
 import json
 import logging
 import secrets
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import (
     BackgroundTasks,
@@ -20,13 +23,15 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.orm import Session
 
-from app.config import Settings
+from app.config import DEFAULT_SECRET_KEY, Settings
 from app.db import build_session_factory
 from app.models import (
+    AuditLog,
     CatalogItem,
     Event,
     Recommendation,
@@ -47,6 +52,8 @@ from app.schemas import (
     IngestionStatusResponse,
     LoginResponse,
     OnboardingStatusResponse,
+    ReindexResponse,
+    RetentionPurgeResponse,
     ScrapeConfirmRequest,
     ScrapeConfirmResponse,
     ScrapePreviewRequest,
@@ -64,11 +71,14 @@ from app.schemas import (
     WidgetResponse,
 )
 from app.security import (
+    SESSION_LIFETIME,
     create_session_token,
     hash_password,
     make_role_dependency,
+    revoke_current_session,
     verify_password,
 )
+from app.services.audit import record_audit_event
 from app.services.admin_overview import (
     event_type_counts,
     feedback_sentiment,
@@ -86,6 +96,8 @@ from app.services.catalog_import import (
     import_catalog_rows,
     parse_catalog_file,
 )
+from app.services.catalog_reconciliation import reconcile_catalog_index
+from app.services.retention import purge_expired_visitor_data
 from app.services.ingestion import (
     FeedSyncError,
     ScrapeError,
@@ -94,6 +106,15 @@ from app.services.ingestion import (
     scrape_preview,
     sync_feed,
 )
+from app.services.scheduler_jobs import (
+    register_context,
+    run_catalog_reconciliation_job,
+    run_feed_sync_job,
+    run_retention_purge_job,
+    unregister_context,
+    upsert_scheduled_job,
+)
+from app.services.telemetry import RequestMetrics, configure_logging, request_id_var
 from app.services.agent_graph import (
     STRONG_RETRIEVAL_DISTANCE,
     WEAK_RETRIEVAL_DISTANCE,
@@ -125,11 +146,14 @@ from app.services.tenants import (
 )
 from app.services.tracing import configure_langsmith
 from app.services.widgets import (
+    ACTIVE_WIDGET_STATUSES,
+    INGESTION_WIDGET_STATUSES,
+    WidgetAuthError,
     configure_feed,
     create_widget,
     onboarding_status as widget_onboarding_status,
     reactivate_widget,
-    resolve_widget_by_api_key,
+    resolve_authorized_widget,
     revoke_api_key,
     rotate_api_key,
     suspend_widget,
@@ -140,10 +164,13 @@ from seed_data import seed_demo_accounts
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BULK_UPLOAD_MAX_BYTES = 2 * 1024 * 1024  # plenty for a few hundred catalog rows
-# TEN-1/TEN-8: a widget only actually renders when its own tenant is in good standing
-# too — a suspended/rejected/still-pending-approval tenant must dark out every widget
-# under it, not just ones an admin remembered to suspend individually.
-WIDGET_BLOCKING_TENANT_STATUSES = {"suspended", "rejected", "pending_approval"}
+
+_WIDGET_AUTH_STATUS_CODES = {
+    "invalid_key": 401,
+    "origin_not_allowed": 403,
+    "widget_not_active": 403,
+    "tenant_not_active": 403,
+}
 
 
 def catalog_item_response(item: CatalogItem) -> CatalogItemResponse:
@@ -180,7 +207,16 @@ def as_utc(value):
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    configure_logging()
     app_settings = settings or Settings()
+    if (
+        app_settings.app_env == "production"
+        and app_settings.secret_key == DEFAULT_SECRET_KEY
+    ):
+        raise RuntimeError(
+            "Refusing to start with APP_ENV=production and the default SECRET_KEY — "
+            "set a real SECRET_KEY (render.yaml already does this via generateValue)."
+        )
     configure_langsmith(app_settings)
     session_factory = build_session_factory(app_settings)
     vector_store = CatalogItemVectorStore(
@@ -216,7 +252,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # AI-engineer `user` role it iterated over is gone — app/services/digest.py stays
     # in place, unregistered, for whenever anonymous-visitor digest delivery is
     # actually specified.
-    scheduler = BackgroundScheduler()
+    #
+    # P1-5: a persistent (SQLAlchemy-backed) job store, not the default in-memory
+    # one — see app/services/scheduler_jobs.py's module docstring for why that
+    # requires the three recurring jobs to be plain module-level functions (looked
+    # up via a context registry) rather than the closures they used to be, and why
+    # that's what actually makes a restart resume the existing schedule instead of
+    # silently resetting it.
+    scheduler = BackgroundScheduler(
+        jobstores={"default": SQLAlchemyJobStore(engine=session_factory.kw["bind"])},
+        job_defaults={
+            # Generous on purpose: a Render free-tier instance can be asleep for a
+            # while, and coalesce=True (the APScheduler default, set explicitly here
+            # for clarity) collapses any backlog of missed runs into one, so a long
+            # grace window just means "still run it once on wake," never "run it N
+            # times to catch up."
+            "misfire_grace_time": 3600,
+            "coalesce": True,
+            "max_instances": 1,
+        },
+    )
+    scheduler_context_id = register_context(session_factory, vector_store, app_settings)
 
     def run_seed() -> None:
         try:
@@ -232,36 +288,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # the DB. Logged so a broken seed doesn't go unnoticed.
             logging.exception("Background seed_demo_accounts failed")
 
-    def run_scheduled_feed_syncs() -> None:
-        """ING-1's sync cadence: sync-on-save (the manual endpoint below) plus this
-        hourly sweep of every widget with a feed configured, so a feed that changes
-        upstream without an admin manually re-triggering still stays current. Scoped
-        per widget now, not per tenant — two widgets under the same tenant can sync
-        from two different feeds (see Widget's docstring)."""
-        with session_factory() as session:
-            widgets = session.scalars(
-                select(Widget).where(Widget.feed_url.is_not(None))
-            ).all()
-            for widget in widgets:
-                try:
-                    sync_feed(session, vector_store, widget)
-                except FeedSyncError:
-                    logging.warning(
-                        "Scheduled feed sync failed for widget_id=%s", widget.id
-                    )
-
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        scheduler.add_job(run_scheduled_feed_syncs, "interval", hours=1, id="feed_sync")
         scheduler.start()
+        upsert_scheduled_job(
+            scheduler,
+            "feed_sync",
+            run_feed_sync_job,
+            scheduler_context_id,
+            trigger="interval",
+            hours=1,
+        )
+        upsert_scheduled_job(
+            scheduler,
+            "catalog_reconciliation",
+            run_catalog_reconciliation_job,
+            scheduler_context_id,
+            trigger="interval",
+            hours=1,
+        )
+        upsert_scheduled_job(
+            scheduler,
+            "retention_purge",
+            run_retention_purge_job,
+            scheduler_context_id,
+            trigger="interval",
+            hours=24,
+        )
         # Fire-and-forget, not awaited: uvicorn should start accepting requests
         # (including /health) immediately rather than waiting on this — see
         # seed_demo_data's docstring for why it used to block startup entirely.
         app.state.seed_task = asyncio.create_task(asyncio.to_thread(run_seed))
+        app.state.reconciliation_task = asyncio.create_task(
+            asyncio.to_thread(run_catalog_reconciliation_job, scheduler_context_id)
+        )
         try:
             yield
         finally:
             scheduler.shutdown(wait=False)
+            unregister_context(scheduler_context_id)
 
     app = FastAPI(
         title="TrailMind",
@@ -277,12 +342,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.scheduler = scheduler
     app.state.pipeline_locks = {}
     app.state.pipeline_locks_guard = asyncio.Lock()
+    app.state.request_metrics = RequestMetrics()
     # DLV-2: (widget_id, visitor_id) -> list of open SSE connections' asyncio.Queue.
     # In-process only (no Redis/pub-sub) — consistent with this repo's other
     # single-process-deployment choices (pipeline_locks above, the TEN-6 rate cap);
-    # a multi-worker deploy would need this revisited. Keyed by widget_id (not
-    # tenant_id) now — the per-widget key cutover moved every auth/retrieval scope
-    # one level deeper (see Widget's docstring in app/models.py).
+    # a multi-worker deploy would need this revisited. This is deliberately deferred,
+    # not an oversight: the current deploy target (render.yaml) is a single free-tier
+    # instance, so there is exactly one process for this dict to ever live in, and
+    # adding a pub/sub layer now would be unused complexity until a second instance
+    # is actually provisioned. Keyed by widget_id (not tenant_id) now — the
+    # per-widget key cutover moved every auth/retrieval scope one level deeper (see
+    # Widget's docstring in app/models.py).
     app.state.widget_connections = {}
     app.state.widget_connections_guard = asyncio.Lock()
     # Permissive at the CORSMiddleware layer on purpose — the tracker SDK and widget
@@ -300,6 +370,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def correlate_and_measure_requests(request: Request, call_next):
+        """P1-6: an inbound X-Request-ID is honored (so a caller's own trace id
+        threads through our logs), otherwise a fresh one is minted per request.
+        `request_id_var` (app/services/telemetry.py) makes it available to every log
+        line emitted anywhere during this request's handling without threading a
+        request object through every function signature — safe across concurrent
+        requests because contextvars are per-asyncio-task, and this coroutine awaits
+        `call_next` directly rather than spawning a separate task."""
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+        token = request_id_var.set(request_id)
+        start = time.monotonic()
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
+        duration_seconds = time.monotonic() - start
+        # The route's path *template* (e.g. "/api/widgets/{widget_id}"), not the raw
+        # URL, keeps /metrics cardinality bounded regardless of how many distinct
+        # widget/tenant ids get requested — only set once routing has matched, hence
+        # reading it from request.scope after call_next rather than before.
+        route = request.scope.get("route")
+        path_template = getattr(route, "path", request.url.path)
+        app.state.request_metrics.record(
+            request.method, path_template, response.status_code, duration_seconds
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+
     # Still needed for tracker.js/widget.js — the embeddable SDK a tenant's own site
     # loads. The admin console itself moved to the separate React app (frontend/);
     # this backend no longer serves any HTML of its own.
@@ -315,6 +415,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # cross-origin while the Render free-tier instance wakes from sleep.
         response.headers["Access-Control-Allow-Origin"] = "*"
         return {"status": "ok", "service": "trailmind"}
+
+    @app.get("/ready")
+    async def ready(response: Response) -> dict:
+        """P1-6: unlike /health (a liveness probe — "is the process up at all"),
+        this actually exercises the dependencies a request needs to succeed: the
+        database, the vector store, and the background scheduler. A deploy platform
+        gating traffic on readiness should point at this endpoint, not /health."""
+        checks: dict[str, str] = {}
+        healthy = True
+
+        try:
+            with session_factory() as session:
+                session.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        except Exception:
+            logging.exception("Readiness check: database unreachable")
+            checks["database"] = "error"
+            healthy = False
+
+        try:
+            vector_store.client.heartbeat()
+            checks["vector_store"] = "ok"
+        except Exception:
+            logging.exception("Readiness check: vector store unreachable")
+            checks["vector_store"] = "error"
+            healthy = False
+
+        checks["scheduler"] = "ok" if scheduler.running else "error"
+        healthy = healthy and scheduler.running
+
+        if not healthy:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "ok" if healthy else "error", "checks": checks}
+
+    @app.get("/metrics")
+    async def metrics() -> PlainTextResponse:
+        """P1-6: basic per-route request counts and cumulative latency, in
+        Prometheus text exposition format — no prometheus_client dependency, since
+        a handful of counters this simple don't need one (see telemetry.py)."""
+        return PlainTextResponse(
+            app.state.request_metrics.render_prometheus_text(),
+            media_type="text/plain; version=0.0.4",
+        )
 
     @app.post("/api/admin/login", response_model=LoginResponse)
     async def admin_login(
@@ -343,18 +486,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         status_code=403,
                         detail="This account's signup request was not approved.",
                     )
-            token = create_session_token(user, app_settings)
-            # The React admin frontend reads `token` from the response body and sends
-            # it back as a bearer token (see app/security.py's get_current_user) — the
-            # cookie is set alongside it only for anything still relying on that path
-            # during the frontend migration.
+            token = create_session_token(session, user, app_settings)
+            # P0-4: the HttpOnly/Secure/SameSite cookie is the real, hardened
+            # session mechanism — a JS-readable bearer token in the response body
+            # is still returned only for backward compatibility with any client
+            # still storing/sending it manually (see AuthContext.tsx's migration to
+            # credentialed cookie requests); nothing about the token's own
+            # long-lived-bearer risk changes for whoever still uses that path.
             response.set_cookie(
                 app_settings.session_cookie_name,
                 token,
                 httponly=True,
                 samesite="lax",
                 secure=app_settings.session_cookie_secure,
-                max_age=60 * 60 * 12,
+                max_age=int(SESSION_LIFETIME.total_seconds()),
+            )
+            record_audit_event(
+                session,
+                action="admin_login",
+                actor_user_id=user.id,
+                tenant_id=user.tenant_id,
+                target_type="user",
+                target_id=user.id,
             )
             return LoginResponse(
                 id=user.id,
@@ -392,7 +545,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
     @app.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
-    async def logout(response: Response) -> None:
+    async def logout(request: Request, response: Response) -> None:
+        # P0-4: revoke the session server-side (see AdminSession/revoke_session),
+        # not just delete the cookie client-side — a bearer token copied out of the
+        # response body before this point would otherwise keep working for the
+        # rest of its 12-hour lifetime even after "logging out."
+        with session_factory() as session:
+            revoke_current_session(request, session, app_settings)
         response.delete_cookie(app_settings.session_cookie_name)
 
     @app.get("/api/admin/me", response_model=UserResponse)
@@ -451,6 +610,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             raw_key = rotate_api_key(session, widget)
+            record_audit_event(
+                session,
+                action="widget_key_rotated",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget",
+                target_id=widget.id,
+            )
             return ApiKeyResponse(api_key=raw_key)
 
     @app.post(
@@ -466,6 +633,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not key or key.widget_id != widget_id:
                 raise HTTPException(status_code=404, detail="Key not found")
             revoke_api_key(session, key_id)
+            record_audit_event(
+                session,
+                action="widget_key_revoked",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget_api_key",
+                target_id=key_id,
+                details={"widget_id": widget_id},
+            )
 
     @app.post(
         "/api/admin/widgets/{widget_id}/suspend",
@@ -477,6 +653,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             suspend_widget(session, widget)
+            record_audit_event(
+                session,
+                action="widget_suspended",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget",
+                target_id=widget.id,
+            )
 
     @app.post(
         "/api/admin/widgets/{widget_id}/reactivate",
@@ -488,6 +672,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             reactivate_widget(session, widget)
+            record_audit_event(
+                session,
+                action="widget_reactivated",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="widget",
+                target_id=widget.id,
+            )
 
     @app.post("/api/admin/widgets/{widget_id}/feed")
     async def set_feed_config(
@@ -520,6 +712,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             invalid=sum(1 for row in rows if row["status"] == "invalid"),
             rows=rows,
         )
+
+    @app.post("/api/admin/widgets/{widget_id}/reindex", response_model=ReindexResponse)
+    async def reindex_widget_catalog(
+        widget_id: int, admin: User = Depends(current_admin)
+    ) -> ReindexResponse:
+        """P0-1: explicit, admin-triggered rebuild of every approved catalog item's
+        vector entry for this widget — unlike the periodic/startup reconciliation
+        pass, this forces a rebuild regardless of the item's recorded state or
+        attempt count, for when an operator already knows one is needed (e.g. after
+        restoring a persistent Chroma disk, or investigating degraded retrieval)."""
+        with session_factory() as session:
+            widget = _get_owned_widget(session, widget_id, admin)
+            report = reconcile_catalog_index(
+                session, vector_store, widget_id=widget.id, force=True
+            )
+        return ReindexResponse(**report.as_dict())
 
     @app.get(
         "/api/admin/widgets/{widget_id}/ingestion/status",
@@ -673,6 +881,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             widget = _get_owned_widget(session, widget_id, admin)
             item = create_catalog_item_service(session, vector_store, widget, payload)
+            record_audit_event(
+                session,
+                action="catalog_item_created",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=item.id,
+                details={"widget_id": widget_id},
+            )
             return catalog_item_response(item)
 
     @app.put(
@@ -689,6 +906,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _get_owned_widget(session, widget_id, admin)
             item = _get_owned_catalog_item(session, widget_id, catalog_item_id)
             update_catalog_item_service(session, vector_store, widget_id, item, payload)
+            record_audit_event(
+                session,
+                action="catalog_item_updated",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=catalog_item_id,
+                details={"widget_id": widget_id},
+            )
             return catalog_item_response(item)
 
     @app.delete(
@@ -702,6 +928,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _get_owned_widget(session, widget_id, admin)
             item = _get_owned_catalog_item(session, widget_id, catalog_item_id)
             delete_catalog_item_service(session, vector_store, widget_id, item)
+            record_audit_event(
+                session,
+                action="catalog_item_deleted",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=catalog_item_id,
+                details={"widget_id": widget_id},
+            )
 
     @app.post(
         "/api/admin/widgets/{widget_id}/catalog-items/bulk-upload",
@@ -742,6 +977,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _get_owned_widget(session, widget_id, admin)
             item = _get_owned_catalog_item(session, widget_id, catalog_item_id)
             approve_catalog_item_service(session, vector_store, widget_id, item)
+            record_audit_event(
+                session,
+                action="catalog_item_approved",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="catalog_item",
+                target_id=catalog_item_id,
+                details={"widget_id": widget_id},
+            )
             return catalog_item_response(item)
 
     @app.post(
@@ -791,6 +1035,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> TenantCreateResponse:
         with session_factory() as session:
             tenant = create_tenant(session, payload.name)
+            record_audit_event(
+                session,
+                action="tenant_created",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
             return TenantCreateResponse(
                 id=tenant.id, name=tenant.name, status=tenant.status
             )
@@ -861,6 +1113,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             suspend_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_suspended",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
 
     @app.post(
         "/api/tenants/{tenant_id}/reactivate", status_code=status.HTTP_204_NO_CONTENT
@@ -873,6 +1133,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             reactivate_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_reactivated",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
 
     @app.post(
         "/api/tenants/{tenant_id}/approve", status_code=status.HTTP_204_NO_CONTENT
@@ -885,6 +1153,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             approve_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_approved",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
 
     @app.post("/api/tenants/{tenant_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
     async def reject_tenant_endpoint(
@@ -895,6 +1171,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not tenant:
                 raise HTTPException(status_code=404, detail="Tenant not found")
             reject_tenant(session, tenant)
+            record_audit_event(
+                session,
+                action="tenant_rejected",
+                actor_user_id=platform_admin.id,
+                tenant_id=tenant.id,
+                target_type="tenant",
+                target_id=tenant.id,
+            )
+
+    @app.get("/api/admin/audit-log")
+    async def audit_log(
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        staff: User = Depends(current_staff),
+    ) -> dict[str, object]:
+        """P0-4: read access to the audit trail — a tenant-scoped `admin` only ever
+        sees their own tenant's entries (including platform-level actions taken on
+        it, e.g. suspension); `platform_admin` sees every tenant's, since a
+        platform-level action itself has no single tenant scope."""
+        with session_factory() as session:
+            query = select(AuditLog).order_by(
+                AuditLog.created_at.desc(), AuditLog.id.desc()
+            )
+            if staff.role != "platform_admin":
+                query = query.where(AuditLog.tenant_id == staff.tenant_id)
+            rows = session.scalars(query.offset(offset).limit(limit + 1)).all()
+            has_more = len(rows) > limit
+            page = rows[:limit]
+            return {
+                "entries": [
+                    {
+                        "id": entry.id,
+                        "action": entry.action,
+                        "actor_user_id": entry.actor_user_id,
+                        "tenant_id": entry.tenant_id,
+                        "target_type": entry.target_type,
+                        "target_id": entry.target_id,
+                        "details": entry.details,
+                        "created_at": as_utc(entry.created_at).isoformat(),
+                    }
+                    for entry in page
+                ],
+                "has_more": has_more,
+            }
 
     @app.get("/api/admin/observability/runs")
     async def observability_runs(
@@ -1069,6 +1389,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # docs/design/09-Platform-Pivot-Decision.md).
             session.delete(user)
             session.commit()
+            record_audit_event(
+                session,
+                action="user_deleted",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="user",
+                target_id=user_id,
+            )
+
+    @app.post("/api/admin/retention/purge", response_model=RetentionPurgeResponse)
+    async def trigger_retention_purge(
+        admin: User = Depends(current_admin),
+    ) -> RetentionPurgeResponse:
+        """P1-3: explicit, admin-triggered purge of this tenant's Event/
+        Recommendation/WidgetSession rows older than Settings.event_retention_days
+        — for an operator who wants to confirm the policy is applied right now
+        rather than waiting on the daily scheduled sweep (see
+        run_scheduled_retention_purge above, which covers every tenant)."""
+        with session_factory() as session:
+            report = purge_expired_visitor_data(
+                session,
+                retention_days=app_settings.event_retention_days,
+                tenant_id=admin.tenant_id,
+            )
+            record_audit_event(
+                session,
+                action="retention_purge_triggered",
+                actor_user_id=admin.id,
+                tenant_id=admin.tenant_id,
+                target_type="tenant",
+                target_id=admin.tenant_id,
+                details=report.as_dict(),
+            )
+        return RetentionPurgeResponse(**report.as_dict())
 
     @app.get("/api/admin/observability/costs")
     async def observability_costs(
@@ -1102,16 +1456,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ],
         }
 
-    def _origin_allowed(widget: Widget, request: Request) -> bool:
-        """Soft, browser-only defense (docs/design/09-Platform-Pivot-Decision.md §5)
-        — an empty `allowed_origins` means "not configured", so every origin is
-        allowed rather than every request being rejected. A non-browser client can
-        always spoof `Origin`/`Referer`; the widget key is the real boundary, this
-        only stops the most naive cross-site misuse from a real browser."""
-        if not widget.allowed_origins:
-            return True
-        origin = request.headers.get("origin") or request.headers.get("referer") or ""
-        return any(origin.startswith(allowed) for allowed in widget.allowed_origins)
+    def _request_origin(request: Request) -> str:
+        return request.headers.get("origin") or request.headers.get("referer") or ""
+
+    def _authorize_widget(
+        session: Session,
+        raw_key: str,
+        request: Request,
+        *,
+        allowed_widget_statuses: frozenset[str] = ACTIVE_WIDGET_STATUSES,
+    ) -> Widget:
+        """The single authorization path for every widget-facing endpoint (tracking
+        ingestion, latest-recommendation polling, SSE stream, widget Q&A, widget
+        activity) — see resolve_authorized_widget's docstring for the policy itself.
+        Translates WidgetAuthError into the matching HTTP status here, at the
+        framework boundary, rather than in the (framework-agnostic) service layer."""
+        try:
+            return resolve_authorized_widget(
+                session,
+                raw_key,
+                _request_origin(request),
+                allowed_widget_statuses=allowed_widget_statuses,
+            )
+        except WidgetAuthError as exc:
+            raise HTTPException(
+                status_code=_WIDGET_AUTH_STATUS_CODES[exc.code], detail=exc.message
+            ) from exc
+
+    def _resolve_widget(widget_key: str, request: Request) -> Widget:
+        """Thin wrapper for the three endpoints that resolve the widget in its own
+        short-lived session and hand back a detached `Widget` for a second session
+        to do the actual work in (SSE stream, widget Q&A, widget activity)."""
+        with session_factory() as session:
+            widget = _authorize_widget(session, widget_key, request)
+            session.expunge(widget)
+            return widget
 
     async def _get_visitor_lock(widget_id: int, visitor_id: str) -> asyncio.Lock:
         key = (widget_id, visitor_id)
@@ -1201,11 +1580,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session; identity is an anonymous, client-generated `visitor_id`, not a
         `User` row."""
         with session_factory() as session:
-            widget = resolve_widget_by_api_key(session, batch.widget_key)
-            if widget is None:
-                raise HTTPException(status_code=401, detail="Invalid widget key")
-            if not _origin_allowed(widget, request):
-                raise HTTPException(status_code=403, detail="Origin not allowed")
+            widget = _authorize_widget(
+                session,
+                batch.widget_key,
+                request,
+                allowed_widget_statuses=INGESTION_WIDGET_STATUSES,
+            )
 
             # A catalog_item_id that doesn't belong to this widget is dropped rather
             # than stored — an event referencing another widget's catalog item id
@@ -1274,16 +1654,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/recommendations/latest")
     async def latest_recommendation_for_visitor(
+        request: Request,
         widget_key: str = Query(...),
         visitor_id: str = Query(...),
     ) -> dict[str, object]:
         """Read fallback for when no real-time push connection is open — same
-        widget-key authentication as ingestion, no separate widget-session mechanism
-        yet."""
+        widget authorization policy as every other widget-facing endpoint (key,
+        origin, widget status, tenant status; see resolve_authorized_widget)."""
         with session_factory() as session:
-            widget = resolve_widget_by_api_key(session, widget_key)
-            if widget is None:
-                raise HTTPException(status_code=401, detail="Invalid widget key")
+            widget = _authorize_widget(session, widget_key, request)
 
             latest = session.scalar(
                 select(Recommendation)
@@ -1383,25 +1762,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "trigger_reason": "activity_retrieval",
                 "evidence": evidence_payload,
             }
-
-    def _resolve_widget(widget_key: str, request: Request) -> Widget:
-        """Shared auth for every /api/widget/* route: resolves the widget key, checks
-        the soft origin allowlist, and enforces TEN-8's render-gate — a widget must
-        stay dark on the host page until it's verified + catalog-ready AND its parent
-        tenant is in good standing, not just have a valid key."""
-        with session_factory() as session:
-            widget = resolve_widget_by_api_key(session, widget_key)
-            if widget is None:
-                raise HTTPException(status_code=401, detail="Invalid widget key")
-            if not _origin_allowed(widget, request):
-                raise HTTPException(status_code=403, detail="Origin not allowed")
-            if widget.status != "active":
-                raise HTTPException(status_code=403, detail="Widget not active")
-            tenant = session.get(Tenant, widget.tenant_id)
-            if tenant is None or tenant.status in WIDGET_BLOCKING_TENANT_STATUSES:
-                raise HTTPException(status_code=403, detail="Tenant not active")
-            session.expunge(widget)
-            return widget
 
     @app.get("/api/widget/stream")
     async def widget_stream(
